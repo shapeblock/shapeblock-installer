@@ -44,17 +44,33 @@ const (
 var tektonAssets embed.FS
 var logger *log.Logger
 
+//go:embed assets/epinio/*
+var epinioAssets embed.FS
+
 func initLogger() error {
 	timestamp := time.Now().Format(timeFormat)
 	logFile := fmt.Sprintf("install-%s.log", timestamp)
 
+	// Check if log file already exists
+	if _, err := os.Stat(logFile); err == nil {
+		// File exists, append to it
+		file, err := os.OpenFile(logFile, os.O_APPEND|os.O_WRONLY, 0666)
+		if err != nil {
+			return fmt.Errorf("failed to open existing log file: %v", err)
+		}
+		logger = log.New(file, "", 0)
+		logger.Printf("=== Installation resumed at %s ===", time.Now().Format(logTimeFormat))
+		return nil
+	}
+
+	// Create new log file
 	file, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {
-		return fmt.Errorf("failed to open log file: %v", err)
+		return fmt.Errorf("failed to create log file: %v", err)
 	}
 
 	logger = log.New(file, "", 0)
-	logger.Printf("Installation started at %s", time.Now().Format(logTimeFormat))
+	logger.Printf("=== Installation started at %s ===", time.Now().Format(logTimeFormat))
 	return nil
 }
 
@@ -80,6 +96,14 @@ type BackendConfig struct {
 	ServiceAccountToken string
 	EpinioUsername      string
 	EpinioPassword      string
+	PostgresUsername    string
+	PostgresPassword    string
+	PostgresDatabase    string
+	PostgresRootPW      string
+	TFStateUsername     string
+	TFStatePassword     string
+	TFStateDatabase     string
+	TFStateRootPW       string
 }
 
 func printStatus(msg string) {
@@ -321,53 +345,70 @@ func createNamespace() error {
 	return nil
 }
 
-func installNginxIngress() error {
-	printStatus("Installing Nginx Ingress...")
-	if err := runCommand("helm", "repo", "add", "bitnami", "https://charts.bitnami.com/bitnami"); err != nil {
-		printError(fmt.Sprintf("Failed to add bitnami repo: %v", err))
-		return fmt.Errorf("failed to add bitnami repo: %v", err)
+func addHelmRepo(name, url string) error {
+	printStatus(fmt.Sprintf("Adding helm repo %s...", name))
+
+	// Check if repo already exists
+	cmd := exec.Command("helm", "repo", "list")
+	output, _ := cmd.Output()
+	if strings.Contains(string(output), name) {
+		printStatus(fmt.Sprintf("Helm repo %s already exists", name))
+		return nil
 	}
 
-	if err := runCommand("helm", "repo", "update"); err != nil {
-		printError(fmt.Sprintf("Failed to update helm repos: %v", err))
-		return fmt.Errorf("failed to update helm repos: %v", err)
-	}
-
-	if err := runCommand("helm", "upgrade", "--install",
-		"nginx-ingress", "bitnami/nginx-ingress-controller",
-		"--version", "11.3.18",
-		"--namespace", "shapeblock",
-		"--create-namespace",
-		"--timeout", "600s"); err != nil {
-		printError(fmt.Sprintf("Failed to install nginx ingress: %v", err))
-		return fmt.Errorf("failed to install nginx ingress: %v", err)
+	if err := runCommand("helm", "repo", "add", name, url); err != nil {
+		return fmt.Errorf("failed to add helm repo %s: %v", name, err)
 	}
 	return nil
 }
 
-func installCertManager() error {
-	printStatus("Installing Cert Manager...")
-	if err := runCommand("helm", "repo", "add", "bitnami", "https://charts.bitnami.com/bitnami"); err != nil {
-		printError(fmt.Sprintf("Failed to add bitnami repo: %v", err))
-		return fmt.Errorf("failed to add bitnami repo: %v", err)
+func resourceExists(kind, name, namespace string) bool {
+	cmd := exec.Command("kubectl", "get", kind, name, "-n", namespace)
+	return cmd.Run() == nil
+}
+
+func installNginxIngress() error {
+	if resourceExists("deployment", "nginx-ingress", "shapeblock") {
+		printStatus("Nginx Ingress already installed")
+		return nil
+	}
+
+	printStatus("Installing Nginx Ingress...")
+	if err := addHelmRepo("bitnami", "https://charts.bitnami.com/bitnami"); err != nil {
+		return err
 	}
 
 	if err := runCommand("helm", "repo", "update"); err != nil {
 		printError(fmt.Sprintf("Failed to update helm repos: %v", err))
-		return fmt.Errorf("failed to update helm repos: %v", err)
+		return err
 	}
 
-	if err := runCommand("helm", "upgrade", "--install",
+	return runCommand("helm", "upgrade", "--install",
+		"nginx-ingress", "bitnami/nginx-ingress-controller",
+		"--version", "11.3.18",
+		"--namespace", "shapeblock",
+		"--create-namespace",
+		"--timeout", "600s")
+}
+
+func installCertManager() error {
+	if resourceExists("deployment", "cert-manager", "cert-manager") {
+		printStatus("Cert Manager already installed")
+		return nil
+	}
+
+	printStatus("Installing Cert Manager...")
+	if err := addHelmRepo("bitnami", "https://charts.bitnami.com/bitnami"); err != nil {
+		return err
+	}
+
+	return runCommand("helm", "upgrade", "--install",
 		"cert-manager", "bitnami/cert-manager",
 		"--version", "1.3.16",
 		"--namespace", "cert-manager",
 		"--create-namespace",
 		"--set", "installCRDs=true",
-		"--timeout", "600s"); err != nil {
-		printError(fmt.Sprintf("Failed to install cert-manager: %v", err))
-		return fmt.Errorf("failed to install cert-manager: %v", err)
-	}
-	return nil
+		"--timeout", "600s")
 }
 
 func installClusterIssuer(email string) error {
@@ -417,6 +458,11 @@ spec:
 }
 
 func installTekton() error {
+	if resourceExists("deployment", "tekton-pipelines-controller", "tekton-pipelines") {
+		printStatus("Tekton already installed")
+		return nil
+	}
+
 	printStatus("Installing Tekton...")
 
 	// Define versions
@@ -441,7 +487,7 @@ func installTekton() error {
 }
 
 func installTektonResources() error {
-	printStatus("Installing Tekton resources...")
+	printStatus("Installing/Updating Tekton resources...")
 
 	resources := []string{
 		// Tasks
@@ -511,6 +557,17 @@ func getServiceAccountToken() (string, error) {
 }
 
 func createServiceAccount(backendConfig *BackendConfig) error {
+	if resourceExists("serviceaccount", "tasks-runner", "shapeblock") {
+		printStatus("Service account already exists")
+		// Still get the token as we need it
+		token, err := getServiceAccountToken()
+		if err != nil {
+			return err
+		}
+		backendConfig.ServiceAccountToken = token
+		return nil
+	}
+
 	printStatus("Creating service account and RBAC resources...")
 
 	// Role YAML
@@ -613,11 +670,15 @@ func generatePassword() string {
 }
 
 func installEpinio(config *Config, backendConfig *BackendConfig) error {
+	if resourceExists("deployment", "epinio", "epinio") {
+		printStatus("Epinio already installed")
+		return nil
+	}
+
 	printStatus("Installing Epinio...")
 
 	// Add Epinio helm repo
-	if err := runCommand("helm", "repo", "add", "epinio", "https://epinio.github.io/helm-charts"); err != nil {
-		printError(fmt.Sprintf("Failed to add epinio repo: %v", err))
+	if err := addHelmRepo("epinio", "https://epinio.github.io/helm-charts"); err != nil {
 		return err
 	}
 
@@ -694,6 +755,205 @@ epinioUI:
 	return nil
 }
 
+func installPostgres(name, username, database string, backendConfig *BackendConfig) error {
+	printStatus(fmt.Sprintf("Installing PostgreSQL instance %s...", name))
+
+	if resourceExists("statefulset", name, "shapeblock") {
+		printStatus(fmt.Sprintf("PostgreSQL instance %s already installed", name))
+		return nil
+	}
+
+	if err := addHelmRepo("bitnami", "https://charts.bitnami.com/bitnami"); err != nil {
+		return err
+	}
+
+	// Generate passwords
+	password := generatePassword()
+	rootPW := generatePassword()
+
+	// Store credentials based on instance name
+	switch name {
+	case "postgresql":
+		backendConfig.PostgresUsername = username
+		backendConfig.PostgresDatabase = database
+		backendConfig.PostgresPassword = password
+		backendConfig.PostgresRootPW = rootPW
+	case "tfstate":
+		backendConfig.TFStateUsername = username
+		backendConfig.TFStateDatabase = database
+		backendConfig.TFStatePassword = password
+		backendConfig.TFStateRootPW = rootPW
+	}
+
+	// Log the credentials
+	logMessage("INFO", fmt.Sprintf("PostgreSQL %s credentials - username: %s, database: %s",
+		name, username, database))
+
+	// Create values.yaml
+	values := fmt.Sprintf(`
+auth:
+  database: %s
+  username: %s
+  password: %s
+  postgresPassword: %s
+architecture: standalone
+primary:
+  persistence:
+    size: 2Gi
+tls:
+  enabled: true
+  autoGenerated: true
+`, database, username, password, rootPW)
+
+	// Write values to temporary file
+	tmpfile, err := os.CreateTemp("", fmt.Sprintf("%s-values-*.yaml", name))
+	if err != nil {
+		printError(fmt.Sprintf("Failed to create temp file: %v", err))
+		return err
+	}
+	defer os.Remove(tmpfile.Name())
+
+	if _, err := tmpfile.WriteString(values); err != nil {
+		printError(fmt.Sprintf("Failed to write values: %v", err))
+		return err
+	}
+	tmpfile.Close()
+
+	// Install PostgreSQL
+	if err := runCommand("helm", "upgrade", "--install",
+		name, "bitnami/postgresql",
+		"--version", "16.2.3",
+		"--namespace", "shapeblock",
+		"--values", tmpfile.Name(),
+		"--timeout", "600s"); err != nil {
+		printError(fmt.Sprintf("Failed to install PostgreSQL %s: %v", name, err))
+		return err
+	}
+
+	printStatus(fmt.Sprintf("PostgreSQL instance %s installed successfully", name))
+	return nil
+}
+
+func createTerraformSecret(backendConfig *BackendConfig) error {
+	printStatus("Creating Terraform credentials secret...")
+
+	if resourceExists("secret", "terraform-creds", "shapeblock") {
+		printStatus("Terraform credentials secret already exists")
+		return nil
+	}
+
+	// Create connection string
+	connStr := fmt.Sprintf("postgres://%s:%s@tfstate-postgresql/%s",
+		backendConfig.TFStateUsername,
+		backendConfig.TFStatePassword,
+		backendConfig.TFStateDatabase)
+
+	// Create secret
+	if err := runCommand("kubectl", "create", "secret", "generic",
+		"terraform-creds",
+		fmt.Sprintf("--from-literal=PG_CONN_STR=%s", connStr),
+		"-n", "shapeblock"); err != nil {
+		printError(fmt.Sprintf("Failed to create Terraform credentials secret: %v", err))
+		return err
+	}
+
+	printStatus("Terraform credentials secret created successfully")
+	return nil
+}
+
+func installRedis() error {
+	printStatus("Installing Redis...")
+
+	if resourceExists("statefulset", "redis", "shapeblock") {
+		printStatus("Redis already installed")
+		return nil
+	}
+
+	if err := addHelmRepo("bitnami", "https://charts.bitnami.com/bitnami"); err != nil {
+		return err
+	}
+
+	// Create values.yaml
+	values := `
+architecture: standalone
+auth:
+  enabled: false
+master:
+  persistence:
+    size: 2Gi`
+
+	// Write values to temporary file
+	tmpfile, err := os.CreateTemp("", "redis-values-*.yaml")
+	if err != nil {
+		printError(fmt.Sprintf("Failed to create temp file: %v", err))
+		return err
+	}
+	defer os.Remove(tmpfile.Name())
+
+	if _, err := tmpfile.WriteString(values); err != nil {
+		printError(fmt.Sprintf("Failed to write values: %v", err))
+		return err
+	}
+	tmpfile.Close()
+
+	// Install Redis
+	if err := runCommand("helm", "upgrade", "--install",
+		"redis", "bitnami/redis",
+		"--version", "18.4.0",
+		"--namespace", "shapeblock",
+		"--values", tmpfile.Name(),
+		"--timeout", "600s"); err != nil {
+		printError(fmt.Sprintf("Failed to install Redis: %v", err))
+		return err
+	}
+
+	printStatus("Redis installed successfully")
+	return nil
+}
+
+func installEpinioResources() error {
+	printStatus("Installing Epinio resources...")
+
+	resources := []string{
+		"assets/epinio/mongodb-sb.yaml",
+		"assets/epinio/mysql-sb.yaml",
+		"assets/epinio/postgresql-sb.yaml",
+		"assets/epinio/redis-sb.yaml",
+	}
+
+	for _, resource := range resources {
+		// Read embedded file
+		content, err := epinioAssets.ReadFile(resource)
+		if err != nil {
+			printError(fmt.Sprintf("Failed to read resource %s: %v", resource, err))
+			return err
+		}
+
+		// Create temporary file
+		tmpfile, err := os.CreateTemp("", "epinio-*.yaml")
+		if err != nil {
+			printError(fmt.Sprintf("Failed to create temp file: %v", err))
+			return err
+		}
+		defer os.Remove(tmpfile.Name())
+
+		// Write content to temp file
+		if _, err := tmpfile.Write(content); err != nil {
+			printError(fmt.Sprintf("Failed to write to temp file: %v", err))
+			return err
+		}
+		tmpfile.Close()
+
+		// Apply the resource
+		if err := runCommand("kubectl", "apply", "-f", tmpfile.Name()); err != nil {
+			printError(fmt.Sprintf("Failed to install Epinio resource %s: %v", resource, err))
+			return err
+		}
+	}
+
+	return nil
+}
+
 func install(config *Config) error {
 	backendConfig := &BackendConfig{}
 
@@ -739,6 +999,29 @@ func install(config *Config) error {
 
 	if err := installEpinio(config, backendConfig); err != nil {
 		return fmt.Errorf("failed to install Epinio: %v", err)
+	}
+
+	// Install main PostgreSQL instance
+	if err := installPostgres("postgresql", "shapeblock", "shapeblock", backendConfig); err != nil {
+		return fmt.Errorf("failed to install main PostgreSQL: %v", err)
+	}
+
+	// Install TFState PostgreSQL instance
+	if err := installPostgres("tfstate", "tfstate", "tfstate", backendConfig); err != nil {
+		return fmt.Errorf("failed to install TFState PostgreSQL: %v", err)
+	}
+
+	// Create Terraform credentials secret
+	if err := createTerraformSecret(backendConfig); err != nil {
+		return fmt.Errorf("failed to create Terraform credentials secret: %v", err)
+	}
+
+	if err := installRedis(); err != nil {
+		return fmt.Errorf("failed to install Redis: %v", err)
+	}
+
+	if err := installEpinioResources(); err != nil {
+		return fmt.Errorf("failed to install Epinio resources: %v", err)
 	}
 
 	return nil
