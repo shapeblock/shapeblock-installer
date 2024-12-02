@@ -121,11 +121,51 @@ func printWarning(msg string) {
 	logMessage("WARN", msg)
 }
 
-func runCommand(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+type Spinner struct {
+	stopChan chan struct{}
+	message  string
+}
+
+func NewSpinner(message string) *Spinner {
+	return &Spinner{
+		stopChan: make(chan struct{}),
+		message:  message,
+	}
+}
+
+func (s *Spinner) Start() {
+	go func() {
+		frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+
+		for i := 0; ; i++ {
+			select {
+			case <-s.stopChan:
+				return
+			case <-ticker.C:
+				fmt.Printf("\r%s %s", frames[i%len(frames)], s.message)
+			}
+		}
+	}()
+}
+
+func (s *Spinner) Stop() {
+	s.stopChan <- struct{}{}
+	fmt.Print("\r") // Clear the line
+}
+
+func runCommand(command string, args ...string) error {
+	spinner := NewSpinner(fmt.Sprintf("Running: %s %s", command, strings.Join(args, " ")))
+	spinner.Start()
+	defer spinner.Stop()
+
+	cmd := exec.Command(command, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("command failed: %v\nOutput: %s", err, string(output))
+	}
+	return nil
 }
 
 func checkMemory() error {
