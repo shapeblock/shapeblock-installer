@@ -1,0 +1,62 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: ssh-cluster
+spec:
+  description: Pipeline to create SSH-based K3s cluster
+  params:
+    - name: clusterHeader
+      type: string
+    - name: sbUrl
+      type: string
+    - name: clusterUuid
+      type: string
+    - name: cloud
+      type: string
+    - name: privateKey
+      type: string
+    - name: devicesJson
+      type: string
+  workspaces:
+    - name: shared
+    - name: artefacts-source
+  tasks:
+    - name: install-k3s
+      taskRef:
+        name: install-k3s
+      params:
+        - name: clusterHeader
+          value: $(params.clusterHeader)
+        - name: sbUrl
+          value: $(params.sbUrl)
+        - name: cloud
+          value: $(params.cloud)
+        - name: privateKey
+          value: $(params.privateKey)
+        - name: devicesJson
+          value: $(params.devicesJson)
+      workspaces:
+        - name: source
+          workspace: shared
+        - name: results
+          workspace: shared
+
+    - name: cluster-artefacts
+      runAfter:
+        - install-k3s
+      taskRef:
+        name: cluster-artefacts
+      params:
+        - name: clusterHeader
+          value: $(params.clusterHeader)
+        - name: sbUrl
+          value: $(params.sbUrl)
+        - name: clusterUuid
+          value: $(params.clusterUuid)
+        - name: workspace
+          value: $(params.clusterUuid)
+      workspaces:
+        - name: source
+          workspace: artefacts-source
+        - name: kubeconfig
+          workspace: shared

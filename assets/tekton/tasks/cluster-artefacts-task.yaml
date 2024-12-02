@@ -1,0 +1,110 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: cluster-artefacts
+spec:
+  description: Run Terraform script to create K8s cluster artefacts.
+  params:
+  - default:
+    - apply
+    - -var-file=/workspace/source/terraform.tfvars
+    - -auto-approve
+    description: The terraform cli commands to tun
+    name: ARGS
+    type: array
+  - default: docker.io/hashicorp/terraform:1.7.4
+    description: the terraform image to use
+    name: image
+    type: string
+  - description: Terraform workspace name
+    name: workspace
+    type: string
+  - description: Cluster header
+    name: clusterHeader
+    type: string
+  - description: SB url
+    name: sbUrl
+    type: string
+  - description: Cluster ID
+    name: clusterUuid
+    type: string
+  - description: Terraform creds
+    name: terraform-secret
+    type: string
+    default: terraform-creds
+  steps:
+  - name: scaffold
+    image: docker.io/alpine/git:v2.40.1
+    script: |
+      git clone https://github.com/shapeblock/cluster-artefacts . --branch epinio
+    workingDir: $(workspaces.source.path)
+
+  - name: get-terraform-tfvars
+    image: docker.io/curlimages/curl:8.1.2
+    script: |
+      curl -o terraform.tfvars -H "Accept: application/text" -H 'X-SB-Signature: $(params.clusterHeader)' $(params.sbUrl)/clusters/cluster-tfvars/
+    workingDir: $(workspaces.source.path)
+
+  - name: tf-init
+    image: $(params.image)
+    script: |
+      terraform init
+    workingDir: $(workspaces.source.path)
+    envFrom:
+      - secretRef:
+          name: $(params.terraform-secret)
+
+  - name: tf-new-workspace
+    args:
+    - workspace
+    - new
+    - $(params.workspace)
+    command:
+    - terraform
+    image: $(params.image)
+    onError: continue
+    workingDir: $(workspaces.source.path)
+    envFrom:
+      - secretRef:
+          name: $(params.terraform-secret)
+
+  - name: tf-select-workspace
+    args:
+    - workspace
+    - select
+    - $(params.workspace)
+    command:
+    - terraform
+    image: $(params.image)
+    workingDir: $(workspaces.source.path)
+    envFrom:
+      - secretRef:
+          name: $(params.terraform-secret)
+
+  - name: prepare-kubeconfig
+    image: $(params.image)
+    script: |
+      cp $(workspaces.kubeconfig.path)/kubeconfig kubeconfig
+      cat kubeconfig
+    workingDir: $(workspaces.source.path)
+
+  - name: tf-apply
+    args:
+    - $(params.ARGS)
+    command:
+    - terraform
+    image: $(params.image)
+    workingDir: $(workspaces.source.path)
+    envFrom:
+      - secretRef:
+          name: $(params.terraform-secret)
+
+  - name: update-cluster-status
+    image: docker.io/curlimages/curl:8.1.2
+    script: |
+      curl -X POST -H 'Content-Type: application/json' -H 'X-SB-Signature: $(params.clusterHeader)' $(params.sbUrl)/clusters/status/
+    workingDir: $(workspaces.source.path)
+
+  workspaces:
+  - name: source
+  - name: kubeconfig

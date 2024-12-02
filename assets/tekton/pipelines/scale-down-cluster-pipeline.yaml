@@ -1,0 +1,57 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: scale-down-cluster
+spec:
+  params:
+  - description: Cluster Header
+    name: clusterHeader
+    type: string
+  - description: SB url
+    name: sbUrl
+    type: string
+  - description: Cluster ID
+    name: clusterUuid
+    type: string
+  - description: Cluster cloud
+    name: cloud
+    type: string
+  - description: CSV list of nodes
+    name: nodes_csv
+    type: string
+  tasks:
+  - name: kubectl
+    params:
+    - name: clusterHeader
+      value: $(params.clusterHeader)
+    - name: sbUrl
+      value: $(params.sbUrl)
+    - name: nodes_csv
+      value: $(params.nodes_csv)
+    taskRef:
+      kind: Task
+      name: kubectl
+  - name: provision-vm
+    params:
+    - name: clusterHeader
+      value: $(params.clusterHeader)
+    - name: sbUrl
+      value: $(params.sbUrl)
+    - name: clusterUuid
+      value: $(params.clusterUuid)
+    - name: workspace
+      value: cluster-$(params.clusterUuid)
+    - name: cloud
+      value: $(params.cloud)
+    - name: op
+      value: scale
+    taskRef:
+      kind: Task
+      name: provision-vm
+    workspaces:
+    - name: source
+      workspace: infra-source
+    runAfter:
+    - kubectl
+  workspaces:
+  - name: infra-source

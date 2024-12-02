@@ -1,0 +1,111 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: destroy-cluster
+spec:
+  description: Run Terraform script to destroy microk8s VMs and other artefacts.
+  params:
+  - default: docker.io/hashicorp/terraform:1.7.4
+    description: the terraform image to use
+    name: image
+    type: string
+  - description: Terraform workspace name
+    name: workspace
+    type: string
+  - description: Cluster header
+    name: clusterHeader
+    type: string
+  - description: SB url
+    name: sbUrl
+    type: string
+  - description: Cluster cloud
+    name: cloud
+    type: string
+  - description: Terraform creds
+    name: terraform-secret
+    type: string
+    default: terraform-creds
+  steps:
+  - name: scaffold
+    image: docker.io/alpine/git:v2.40.1
+    script: |
+      if [ "$(params.cloud)" == "aws" ] ; then
+        git clone https://github.com/badri/microk8s-setup-aws .
+      else
+        git clone https://github.com/badri/microk8s-setup . --branch k3s
+      fi
+    workingDir: $(workspaces.source.path)
+
+  - name: get-terraform-tfvars
+    image: docker.io/curlimages/curl:8.1.2
+    script: |
+      curl -o terraform.tfvars -H "Accept: application/text" -H 'X-SB-Signature: $(params.clusterHeader)' $(params.sbUrl)/clusters/infra-tfvars/
+    workingDir: $(workspaces.source.path)
+  - name: tf-init
+    image: $(params.image)
+    script: |
+      terraform init
+    workingDir: $(workspaces.source.path)
+    envFrom:
+      - secretRef:
+          name: $(params.terraform-secret)
+
+  - name: tf-select-workspace
+    args:
+    - workspace
+    - select
+    - $(params.workspace)
+    command:
+    - terraform
+    image: $(params.image)
+    workingDir: $(workspaces.source.path)
+    envFrom:
+      - secretRef:
+          name: $(params.terraform-secret)
+
+  - name: tf-destroy
+    args:
+    - destroy
+    - -var-file=$(workspaces.source.path)/terraform.tfvars
+    - -auto-approve
+    command:
+    - terraform
+    image: $(params.image)
+    workingDir: $(workspaces.source.path)
+    envFrom:
+      - secretRef:
+          name: $(params.terraform-secret)
+
+  - name: tf-workspace-switch
+    image: $(params.image)
+    args:
+    - workspace
+    - select
+    - default
+    command:
+    - terraform
+    workingDir: $(workspaces.source.path)
+    envFrom:
+      - secretRef:
+          name: $(params.terraform-secret)
+
+  - name: tf-workspace-delete
+    image: $(params.image)
+    args:
+    - workspace
+    - delete
+    - $(params.workspace)
+    command:
+    - terraform
+    workingDir: $(workspaces.source.path)
+    envFrom:
+      - secretRef:
+          name: $(params.terraform-secret)
+
+  - name: send-ack
+    image: docker.io/curlimages/curl:8.1.2
+    script: |
+      curl -X POST -H 'Content-Type: application/json' -H 'X-SB-Signature: $(params.clusterHeader)' $(params.sbUrl)/clusters/destroy/
+    workingDir: $(workspaces.source.path)
+  workspaces:
+  - name: source

@@ -1,0 +1,96 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: remove-k3s-node
+spec:
+  description: Remove nodes from a k3s cluster
+  params:
+  - default: docker.io/shapeblock/k3sup:2024-12-01
+    description: the k3sup image to use
+    name: image
+    type: string
+  - description: Cluster header
+    name: clusterHeader
+    type: string
+  - description: SB url
+    name: sbUrl
+    type: string
+  - description: Cloud
+    name: cloud
+    type: string
+  - description: SSH private key content (base64 encoded)
+    name: privateKey
+    type: string
+  - description: Nodes to remove (base64 encoded JSON)
+    name: nodesToRemove
+    type: string
+
+  steps:
+  - name: prepare-files
+    image: $(params.image)
+    script: |
+      # Decode private key
+      echo '$(params.privateKey)' | base64 -d > private-key
+      chmod 400 private-key
+
+      # Decode nodes list
+      echo '$(params.nodesToRemove)' | base64 -d > nodes.json
+
+      # Get kubeconfig
+      curl -o kubeconfig -H 'X-SB-Signature: $(params.clusterHeader)' $(params.sbUrl)/clusters/kubeconfig/
+      chmod 600 kubeconfig
+      # Set SSH user based on cloud
+      if [ "$(params.cloud)" = "aws" ]; then
+        echo "ubuntu" > ssh_user
+      else
+        echo "root" > ssh_user
+      fi
+    workingDir: $(workspaces.source.path)
+
+  - name: drain-and-remove
+    image: $(params.image)
+    script: |
+      #!/usr/bin/env bash
+      set -e
+
+      export KUBECONFIG=$(workspaces.source.path)/kubeconfig
+      SSH_USER=$(cat ssh_user)
+      # Function to SSH and run command
+      run_ssh_command() {
+        local host="$1"
+        local command="$2"
+        ssh -i private-key -o StrictHostKeyChecking=no \
+            "${SSH_USER}@$host" "$command"
+      }
+
+      # Read nodes from JSON
+      nodes=$(cat nodes.json | jq -c '.[]')
+
+      for node in $nodes; do
+        node_name=$(echo $node | jq -r '.hostname')
+        node_ip=$(echo $node | jq -r '.ip')
+        echo "Processing node: $node_name ($node_ip)"
+
+        # Drain the node
+        echo "Draining node $node_name..."
+        kubectl --kubeconfig=$KUBECONFIG drain $node_name --delete-emptydir-data --ignore-daemonsets --force --timeout=60s || true
+
+        # Run uninstall script on the node
+        echo "Uninstalling k3s from $node_name..."
+        run_ssh_command "$node_ip" "/usr/local/bin/k3s-uninstall.sh" || true
+
+        # Delete the node from cluster
+        echo "Removing node $node_name from cluster..."
+        kubectl --kubeconfig=$KUBECONFIG delete node $node_name || true
+
+        echo "Node $node_name removed successfully"
+      done
+
+      # Update cluster status via API
+      curl -X POST -H 'Content-Type: application/json' \
+           -H 'X-SB-Signature: $(params.clusterHeader)' \
+           $(params.sbUrl)/clusters/status/
+    workingDir: $(workspaces.source.path)
+
+  workspaces:
+  - name: source

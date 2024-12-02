@@ -1,0 +1,124 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: install-k3s
+spec:
+  description: Run k3sup to install k3s on nodes
+  params:
+  - default: docker.io/shapeblock/k3sup:2024-12-01
+    description: the k3sup image to use
+    name: image
+    type: string
+  - description: Cluster header
+    name: clusterHeader
+    type: string
+  - description: SB url
+    name: sbUrl
+    type: string
+  - description: Kind of operation to run
+    name: op
+    type: string
+    default: create
+  - description: Cloud
+    name: cloud
+    type: string
+  - description: SSH private key content
+    name: privateKey
+    type: string
+    default: ""
+  - description: JSON dump of cluster nodes
+    name: devicesJson
+    type: string
+    default: ""
+
+  results:
+  - description: Kubeconfig of the k3s cluster.
+    name: kubeconfig
+    type: string
+
+  steps:
+  - name: prepare-key
+    image: $(params.image)
+    script: |
+      if [ -n "$(params.privateKey)" ]; then
+        echo '$(params.privateKey)' | base64 -d > private-key
+        chmod 400 private-key
+      elif [ -f "$(workspaces.ssh.path)/private-key" ]; then
+        cp $(workspaces.ssh.path)/private-key private-key
+        chmod 400 private-key
+      fi
+      cat private-key
+    workingDir: $(workspaces.source.path)
+
+  - name: prepare-inventory
+    image: $(params.image)
+    script: |
+      if [ -n "$(params.devicesJson)" ]; then
+        echo '$(params.devicesJson)' | base64 -d > devices.json
+      elif [ -f "$(workspaces.inventory.path)/devices.json" ]; then
+        cp $(workspaces.inventory.path)/devices.json devices.json
+      fi
+      cat devices.json
+      if [ -f "$(workspaces.inventory.path)/vms" ]; then
+        cp $(workspaces.inventory.path)/vms vms
+      fi
+      if [ -f "$(workspaces.inventory.path)/inventory" ]; then
+        cp $(workspaces.inventory.path)/inventory inventory
+      fi
+    workingDir: $(workspaces.source.path)
+
+  - name: setup-k3s
+    image: $(params.image)
+    script: |
+      #!/usr/bin/env bash
+      if [ "$(params.cloud)" == "aws" ]; then
+        install-k3s.sh devices.json ubuntu
+      else
+        install-k3s.sh devices.json root
+      fi
+      if [ "$(params.op)" == "create" ] ; then
+        curl -H 'Content-Type: application/yaml' -H 'X-SB-Signature: $(params.clusterHeader)' --data-binary "@kubeconfig" $(params.sbUrl)/clusters/kubeconfig/
+        cp kubeconfig $(workspaces.results.path)/kubeconfig
+        cp vms $(workspaces.results.path)/vms
+      fi
+      if [ "$(params.op)" == "scale" ] ; then
+        curl -H 'Content-Type: application/json' -H 'X-SB-Signature: $(params.clusterHeader)' --data-binary "@vms" $(params.sbUrl)/clusters/nodeinfo/
+        curl -X POST -H 'Content-Type: application/json' -H 'X-SB-Signature: $(params.clusterHeader)' $(params.sbUrl)/clusters/status/
+      fi
+    workingDir: $(workspaces.source.path)
+
+  - name: pull-buildpacks
+    image: docker.io/cytopia/ansible:2.13-tools
+    script: |
+      #!/usr/bin/env bash
+
+      # Create ansible playbook
+      cat << 'EOF' > pull-buildpacks.yml
+      ---
+      - hosts: all
+        become: true
+        tasks:
+          - name: Pull buildpacks image
+            shell: k3s ctr images pull docker.io/paketobuildpacks/builder-jammy-full:0.3.398
+            register: pull_result
+            retries: 3
+            delay: 5
+            until: pull_result.rc == 0
+      EOF
+
+      # Run ansible playbook using the existing inventory
+      ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook \
+        -i inventory \
+        --private-key private-key \
+        pull-buildpacks.yml
+    workingDir: $(workspaces.source.path)
+    onError: continue
+
+  workspaces:
+  - name: source
+  - name: inventory
+    optional: true
+  - name: ssh
+    optional: true
+  - name: results
+    optional: true

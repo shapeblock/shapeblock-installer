@@ -1,0 +1,73 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: scale-up-cluster
+spec:
+  params:
+  - description: Cluster Header
+    name: clusterHeader
+    type: string
+  - description: SB url
+    name: sbUrl
+    type: string
+  - description: Cluster ID
+    name: clusterUuid
+    type: string
+  - description: Cluster cloud
+    name: cloud
+    type: string
+  - description: Kind of operation
+    name: op
+    type: string
+    default: scale
+  tasks:
+  - name: provision-vm
+    params:
+    - name: clusterHeader
+      value: $(params.clusterHeader)
+    - name: sbUrl
+      value: $(params.sbUrl)
+    - name: clusterUuid
+      value: $(params.clusterUuid)
+    - name: workspace
+      value: cluster-$(params.clusterUuid)
+    - name: cloud
+      value: $(params.cloud)
+    - name: op
+      value: scale
+    taskRef:
+      kind: Task
+      name: provision-vm
+    workspaces:
+    - name: source
+      workspace: infra-source
+    - name: results
+      workspace: shared
+  - name: install-k3s
+    params:
+    - name: clusterHeader
+      value: $(params.clusterHeader)
+    - name: sbUrl
+      value: $(params.sbUrl)
+    - name: op
+      value: $(params.op)
+    - name: cloud
+      value: $(params.cloud)
+    runAfter:
+    - provision-vm
+    taskRef:
+      kind: Task
+      name: install-k3s
+    workspaces:
+    - name: source
+      workspace: playbook-source
+    - name: inventory
+      workspace: shared
+    - name: ssh
+      workspace: shared
+    - name: results
+      workspace: shared
+  workspaces:
+  - name: infra-source
+  - name: playbook-source
+  - name: shared

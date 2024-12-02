@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -12,6 +11,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"embed"
 
 	"github.com/manifoldco/promptui"
 )
@@ -37,6 +38,8 @@ const (
 	cliVersion = "1.0.0"
 )
 
+//go:embed assets/tekton/*
+var tektonAssets embed.FS
 var logger *log.Logger
 
 func initLogger() error {
@@ -429,6 +432,58 @@ func installTekton() error {
 	return nil
 }
 
+func installTektonResources() error {
+	printStatus("Installing Tekton resources...")
+
+	resources := []string{
+		// Tasks
+		"assets/tekton/tasks/cluster-artefacts-task.yaml",
+		"assets/tekton/tasks/destroy-cluster-task.yaml",
+		"assets/tekton/tasks/k3s-remove-node-task.yaml",
+		"assets/tekton/tasks/k3sup-task.yaml",
+		"assets/tekton/tasks/kubectl-task.yaml",
+		"assets/tekton/tasks/terraform-infra-task.yaml",
+
+		// Pipelines
+		"assets/tekton/pipelines/create-cluster-pipeline.yaml",
+		"assets/tekton/pipelines/scale-down-cluster-pipeline.yaml",
+		"assets/tekton/pipelines/scale-up-cluster-pipeline.yaml",
+		"assets/tekton/pipelines/ssh-cluster-pipeline.yaml",
+	}
+
+	for _, resource := range resources {
+		// Read embedded file
+		content, err := tektonAssets.ReadFile(resource)
+		if err != nil {
+			printError(fmt.Sprintf("Failed to read resource %s: %v", resource, err))
+			return err
+		}
+
+		// Create temporary file
+		tmpfile, err := os.CreateTemp("", "tekton-*.yaml")
+		if err != nil {
+			printError(fmt.Sprintf("Failed to create temp file: %v", err))
+			return err
+		}
+		defer os.Remove(tmpfile.Name())
+
+		// Write content to temp file
+		if _, err := tmpfile.Write(content); err != nil {
+			printError(fmt.Sprintf("Failed to write to temp file: %v", err))
+			return err
+		}
+		tmpfile.Close()
+
+		// Apply the resource
+		if err := runCommand("kubectl", "apply", "-f", tmpfile.Name()); err != nil {
+			printError(fmt.Sprintf("Failed to install Tekton resource %s: %v", resource, err))
+			return err
+		}
+	}
+
+	return nil
+}
+
 func install(config *Config) error {
 	if err := checkMemory(); err != nil {
 		return err
@@ -462,11 +517,9 @@ func install(config *Config) error {
 		return fmt.Errorf("failed to install Tekton: %v", err)
 	}
 
-	// Add remaining installation steps
-	// - install_k3s
-	// - install_helm_charts
-	// - install_shapeblock
-	// - verify_installation
+	if err := installTektonResources(); err != nil {
+		return fmt.Errorf("failed to install Tekton resources: %v", err)
+	}
 
 	return nil
 }
@@ -628,16 +681,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	var config Config
-
-	// Parse command line flags
-	installCmd := flag.NewFlagSet("install", flag.ExitOnError)
-	installCmd.StringVar(&config.LicenseKey, "license", "", "License key")
-	installCmd.StringVar(&config.AdminUsername, "username", "", "Admin username")
-	installCmd.StringVar(&config.AdminEmail, "email", "", "Admin email")
-	installCmd.StringVar(&config.AdminPassword, "password", "", "Admin password")
-	installCmd.StringVar(&config.DomainName, "domain", "", "Domain name (optional)")
-
 	if len(os.Args) < 2 {
 		fmt.Println("expected 'install' subcommand")
 		os.Exit(1)
@@ -645,7 +688,7 @@ func main() {
 
 	switch os.Args[1] {
 	case "install":
-		installCmd.Parse(os.Args[2:])
+		var config Config
 		if err := collectInput(&config); err != nil {
 			printError(fmt.Sprintf("Failed to collect input: %v", err))
 			os.Exit(1)

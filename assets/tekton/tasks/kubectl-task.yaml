@@ -1,0 +1,59 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: kubectl
+spec:
+  params:
+  - name: nodes_csv
+    type: string
+    description: "CSV list of node names to drain and delete"
+  - default: docker.io/shapeblock/kubectl:2024-04-15
+    description: the k3sup image to use
+    name: image
+    type: string
+  - description: Cluster header
+    name: clusterHeader
+    type: string
+  - description: SB url
+    name: sbUrl
+    type: string
+
+  steps:
+    - name: drain-and-delete
+      image: $(params.image)
+      script: |
+        #!/bin/bash
+
+        # get kubeconfig
+        curl -o kubeconfig -H 'Accept: application/yaml' -H 'X-SB-Signature: $(params.clusterHeader)' $(params.sbUrl)/clusters/get-kubeconfig/
+        # Read the nodes_csv parameter into the NODES_CSV environment variable
+        export NODES_CSV="$(params.nodes_csv)"
+
+        # Check if NODES_CSV is set
+        if [ -z "$NODES_CSV" ]; then
+          echo "Error: NODES_CSV environment variable is not set."
+          exit 1
+        fi
+        export KUBECONFIG=/workspace/kubeconfig
+        IFS=',' read -r -a node_array <<< "$NODES_CSV"
+
+        for node in "${node_array[@]}"; do
+          echo "Draining node: $node"
+          kubectl drain "$node" --delete-emptydir-data --force --ignore-daemonsets
+
+          if [ $? -eq 0 ]; then
+            echo "Successfully drained node: $node"
+            echo "Deleting node: $node"
+            kubectl delete node "$node"
+
+            if [ $? -eq 0 ]; then
+              echo "Successfully deleted node: $node"
+            else
+              echo "Failed to delete node: $node"
+              exit 1
+            fi
+          else
+            echo "Failed to drain node: $node"
+            exit 1
+          fi
+        done
