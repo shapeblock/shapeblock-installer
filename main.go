@@ -1,21 +1,19 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"strings"
-	"syscall"
 	"time"
 
-	"golang.org/x/term"
+	"github.com/manifoldco/promptui"
 )
 
 const (
@@ -33,7 +31,9 @@ const (
 	logTimeFormat = "2006/01/02 15:04:05"
 
 	// CLI constants
-	cliName    = "shapeblock-installer"
+	//nolint:unused
+	cliName = "shapeblock-installer"
+	//nolint:unused
 	cliVersion = "1.0.0"
 )
 
@@ -96,7 +96,7 @@ func runCommand(name string, args ...string) error {
 func checkMemory() error {
 	printStatus("Checking system memory...")
 
-	content, err := ioutil.ReadFile("/proc/meminfo")
+	content, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
 		return fmt.Errorf("failed to read meminfo: %v", err)
 	}
@@ -301,6 +301,134 @@ func activateLicense(config *Config) error {
 	return nil
 }
 
+func createNamespace() error {
+	printStatus("Creating shapeblock namespace...")
+	if err := runCommand("kubectl", "create", "namespace", "shapeblock", "--dry-run=client", "-o", "yaml", "|", "kubectl", "apply", "-f", "-"); err != nil {
+		printError(fmt.Sprintf("Failed to create namespace: %v", err))
+		return err
+	}
+	return nil
+}
+
+func installNginxIngress() error {
+	printStatus("Installing Nginx Ingress...")
+	if err := runCommand("helm", "repo", "add", "bitnami", "https://charts.bitnami.com/bitnami"); err != nil {
+		printError(fmt.Sprintf("Failed to add bitnami repo: %v", err))
+		return fmt.Errorf("failed to add bitnami repo: %v", err)
+	}
+
+	if err := runCommand("helm", "repo", "update"); err != nil {
+		printError(fmt.Sprintf("Failed to update helm repos: %v", err))
+		return fmt.Errorf("failed to update helm repos: %v", err)
+	}
+
+	if err := runCommand("helm", "upgrade", "--install",
+		"nginx-ingress", "bitnami/nginx-ingress-controller",
+		"--version", "11.3.18",
+		"--namespace", "shapeblock",
+		"--create-namespace",
+		"--timeout", "600s"); err != nil {
+		printError(fmt.Sprintf("Failed to install nginx ingress: %v", err))
+		return fmt.Errorf("failed to install nginx ingress: %v", err)
+	}
+	return nil
+}
+
+func installCertManager() error {
+	printStatus("Installing Cert Manager...")
+	if err := runCommand("helm", "repo", "add", "bitnami", "https://charts.bitnami.com/bitnami"); err != nil {
+		printError(fmt.Sprintf("Failed to add bitnami repo: %v", err))
+		return fmt.Errorf("failed to add bitnami repo: %v", err)
+	}
+
+	if err := runCommand("helm", "repo", "update"); err != nil {
+		printError(fmt.Sprintf("Failed to update helm repos: %v", err))
+		return fmt.Errorf("failed to update helm repos: %v", err)
+	}
+
+	if err := runCommand("helm", "upgrade", "--install",
+		"cert-manager", "bitnami/cert-manager",
+		"--version", "1.3.16",
+		"--namespace", "cert-manager",
+		"--create-namespace",
+		"--set", "installCRDs=true",
+		"--timeout", "600s"); err != nil {
+		printError(fmt.Sprintf("Failed to install cert-manager: %v", err))
+		return fmt.Errorf("failed to install cert-manager: %v", err)
+	}
+	return nil
+}
+
+func installClusterIssuer(email string) error {
+	printStatus("Installing ClusterIssuer...")
+
+	// Wait for cert-manager to be ready
+	printStatus("Waiting 30 seconds for cert-manager to be ready...")
+	time.Sleep(30 * time.Second)
+
+	// Create cluster issuer YAML with the provided email
+	issuerYAML := fmt.Sprintf(`apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    email: %s
+    server: https://acme-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: letsencrypt-secret-prod
+    solvers:
+    - http01:
+        ingress:
+          class: nginx`, email)
+
+	// Write YAML to temporary file
+	tmpfile, err := os.CreateTemp("", "cluster-issuer-*.yaml")
+	if err != nil {
+		printError(fmt.Sprintf("Failed to create temp file: %v", err))
+		return err
+	}
+	defer os.Remove(tmpfile.Name())
+
+	if _, err := tmpfile.WriteString(issuerYAML); err != nil {
+		printError(fmt.Sprintf("Failed to write YAML: %v", err))
+		return err
+	}
+	tmpfile.Close()
+
+	// Apply the cluster issuer
+	if err := runCommand("kubectl", "apply", "-f", tmpfile.Name()); err != nil {
+		printError(fmt.Sprintf("Failed to apply cluster issuer: %v", err))
+		return err
+	}
+
+	return nil
+}
+
+func installTekton() error {
+	printStatus("Installing Tekton...")
+
+	// Define versions
+	tektonVersion := "v0.74.0"
+	dashboardVersion := "v0.52.0"
+
+	// Install Tekton Pipelines
+	releaseURL := fmt.Sprintf("https://storage.googleapis.com/tekton-releases/pipeline/previous/%s/release.yaml", tektonVersion)
+	if err := runCommand("kubectl", "apply", "-f", releaseURL); err != nil {
+		printError(fmt.Sprintf("Failed to install Tekton: %v", err))
+		return fmt.Errorf("failed to install Tekton: %v", err)
+	}
+
+	// Install Tekton Dashboard
+	dashboardURL := fmt.Sprintf("https://storage.googleapis.com/tekton-releases/dashboard/previous/%s/release.yaml", dashboardVersion)
+	if err := runCommand("kubectl", "apply", "-f", dashboardURL); err != nil {
+		printError(fmt.Sprintf("Failed to install Tekton Dashboard: %v", err))
+		return fmt.Errorf("failed to install Tekton Dashboard: %v", err)
+	}
+
+	return nil
+}
+
 func install(config *Config) error {
 	if err := checkMemory(); err != nil {
 		return err
@@ -314,6 +442,26 @@ func install(config *Config) error {
 		return err
 	}
 
+	if err := createNamespace(); err != nil {
+		return fmt.Errorf("failed to create namespace: %v", err)
+	}
+
+	if err := installNginxIngress(); err != nil {
+		return fmt.Errorf("failed to install nginx ingress: %v", err)
+	}
+
+	if err := installCertManager(); err != nil {
+		return fmt.Errorf("failed to install cert-manager: %v", err)
+	}
+
+	if err := installClusterIssuer(config.AdminEmail); err != nil {
+		return fmt.Errorf("failed to install cluster issuer: %v", err)
+	}
+
+	if err := installTekton(); err != nil {
+		return fmt.Errorf("failed to install Tekton: %v", err)
+	}
+
 	// Add remaining installation steps
 	// - install_k3s
 	// - install_helm_charts
@@ -323,141 +471,140 @@ func install(config *Config) error {
 	return nil
 }
 
-func collectInput(config *Config) error {
-	printStatus("Please provide the following information:")
-
-	// Helper function to read input with validation
-	readInput := func(prompt string, required bool, validator func(string) error) (string, error) {
-		reader := bufio.NewReader(os.Stdin)
-		for {
-			fmt.Printf("%s: ", prompt)
-			input, err := reader.ReadString('\n')
-			if err != nil {
-				return "", err
-			}
-			input = strings.TrimSpace(input)
-
-			if input == "" && required {
-				printError("This field is required")
-				continue
-			}
-
-			if input != "" && validator != nil {
-				if err := validator(input); err != nil {
-					printError(err.Error())
-					continue
-				}
-			}
-
-			return input, nil
-		}
+func validateRequired(input string) error {
+	if len(input) == 0 {
+		return errors.New("this field is required")
 	}
+	return nil
+}
 
-	// Read password with confirmation
-	readPassword := func(prompt string) (string, error) {
-		for {
-			fmt.Printf("%s: ", prompt)
-			password, err := term.ReadPassword(int(syscall.Stdin))
-			if err != nil {
-				return "", err
-			}
-			fmt.Println()
-
-			fmt.Print("Confirm password: ")
-			confirm, err := term.ReadPassword(int(syscall.Stdin))
-			if err != nil {
-				return "", err
-			}
-			fmt.Println()
-
-			if string(password) != string(confirm) {
-				printError("Passwords do not match")
-				continue
-			}
-
-			if len(password) == 0 {
-				printError("Password cannot be empty")
-				continue
-			}
-
-			return string(password), nil
-		}
-	}
-
-	// Validate email format
-	emailValidator := func(email string) error {
-		if !strings.Contains(email, "@") || !strings.Contains(email, ".") {
-			return fmt.Errorf("invalid email format")
-		}
-		return nil
-	}
-
-	// Collect required inputs if not provided via flags
-	var err error
-
-	if config.LicenseKey == "" {
-		config.LicenseKey, err = readInput("License key", true, nil)
-		if err != nil {
-			return err
-		}
-	}
-
-	if config.AdminUsername == "" {
-		config.AdminUsername, err = readInput("Admin username", true, nil)
-		if err != nil {
-			return err
-		}
-	}
-
-	if config.AdminEmail == "" {
-		config.AdminEmail, err = readInput("Admin email", true, emailValidator)
-		if err != nil {
-			return err
-		}
-	}
-
-	if config.AdminPassword == "" {
-		config.AdminPassword, err = readPassword("Admin password")
-		if err != nil {
-			return err
-		}
-	}
-
-	if config.DomainName == "" {
-		config.DomainName, err = readInput("Domain name (optional)", false, nil)
-		if err != nil {
-			return err
-		}
-	}
-
-	// Ask about email configuration
-	configureEmailStr, err := readInput("Configure email settings? (y/N)", false, nil)
-	if err != nil {
+func validateEmail(input string) error {
+	if err := validateRequired(input); err != nil {
 		return err
 	}
+	if !strings.Contains(input, "@") || !strings.Contains(input, ".") {
+		return errors.New("invalid email format")
+	}
+	return nil
+}
 
-	config.ConfigureEmail = strings.ToLower(configureEmailStr) == "y"
+func collectInput(config *Config) error {
+	// License Key
+	prompt := promptui.Prompt{
+		Label:    "License key",
+		Validate: validateRequired,
+	}
+	result, err := prompt.Run()
+	if err != nil {
+		return fmt.Errorf("prompt failed: %v", err)
+	}
+	config.LicenseKey = result
+
+	// Admin Username
+	prompt = promptui.Prompt{
+		Label:    "Admin username",
+		Validate: validateRequired,
+	}
+	result, err = prompt.Run()
+	if err != nil {
+		return fmt.Errorf("prompt failed: %v", err)
+	}
+	config.AdminUsername = result
+
+	// Admin Email
+	prompt = promptui.Prompt{
+		Label:    "Admin email",
+		Validate: validateEmail,
+	}
+	result, err = prompt.Run()
+	if err != nil {
+		return fmt.Errorf("prompt failed: %v", err)
+	}
+	config.AdminEmail = result
+
+	// Admin Password
+	prompt = promptui.Prompt{
+		Label: "Admin password",
+		Mask:  '*',
+		Validate: func(input string) error {
+			if len(input) == 0 {
+				return errors.New("this field is required")
+			}
+			return nil
+		},
+	}
+	result, err = prompt.Run()
+	if err != nil {
+		return fmt.Errorf("prompt failed: %v", err)
+	}
+	config.AdminPassword = result
+
+	// Domain Name
+	prompt = promptui.Prompt{
+		Label: "Domain name (optional)",
+	}
+	result, err = prompt.Run()
+	if err != nil {
+		return fmt.Errorf("prompt failed: %v", err)
+	}
+	config.DomainName = result
+
+	// Configure Email
+	configureEmailPrompt := promptui.Select{
+		Label: "Configure email settings?",
+		Items: []string{"Yes", "No"},
+	}
+	_, result, err = configureEmailPrompt.Run()
+	if err != nil {
+		return fmt.Errorf("prompt failed: %v", err)
+	}
+	config.ConfigureEmail = result == "Yes"
 
 	if config.ConfigureEmail {
-		config.SMTPHost, err = readInput("SMTP host", true, nil)
-		if err != nil {
-			return err
+		// SMTP Host
+		prompt = promptui.Prompt{
+			Label:    "SMTP host",
+			Validate: validateRequired,
 		}
+		result, err = prompt.Run()
+		if err != nil {
+			return fmt.Errorf("prompt failed: %v", err)
+		}
+		config.SMTPHost = result
 
-		config.SMTPPort, err = readInput("SMTP port", true, nil)
-		if err != nil {
-			return err
+		// SMTP Port
+		prompt = promptui.Prompt{
+			Label:    "SMTP port",
+			Validate: validateRequired,
 		}
+		result, err = prompt.Run()
+		if err != nil {
+			return fmt.Errorf("prompt failed: %v", err)
+		}
+		config.SMTPPort = result
 
-		config.SMTPUsername, err = readInput("SMTP username", true, nil)
-		if err != nil {
-			return err
+		// SMTP Username
+		prompt = promptui.Prompt{
+			Label:    "SMTP username",
+			Validate: validateRequired,
 		}
+		result, err = prompt.Run()
+		if err != nil {
+			return fmt.Errorf("prompt failed: %v", err)
+		}
+		config.SMTPUsername = result
 
-		config.SMTPPassword, err = readPassword("SMTP password")
-		if err != nil {
-			return err
+		// SMTP Password
+		prompt = promptui.Prompt{
+			Label:    "SMTP password",
+			Validate: validateRequired,
+			Mask:     '*',
 		}
+		result, err = prompt.Run()
+		if err != nil {
+			return fmt.Errorf("prompt failed: %v", err)
+		}
+		config.SMTPPassword = result
 	}
 
 	// Log collected information (excluding passwords)
