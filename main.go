@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"embed"
 
 	"github.com/manifoldco/promptui"
+	"golang.org/x/exp/rand"
 )
 
 const (
@@ -72,6 +74,12 @@ type Config struct {
 	SMTPPort       string
 	SMTPUsername   string
 	SMTPPassword   string
+}
+
+type BackendConfig struct {
+	ServiceAccountToken string
+	EpinioUsername      string
+	EpinioPassword      string
 }
 
 func printStatus(msg string) {
@@ -484,7 +492,211 @@ func installTektonResources() error {
 	return nil
 }
 
+func getServiceAccountToken() (string, error) {
+	cmd := exec.Command("kubectl", "get", "secret", "tasks-runner-token", "-n", "shapeblock",
+		"-o", "jsonpath={.data.token}")
+	tokenBytes, err := cmd.Output()
+	if err != nil {
+		printError(fmt.Sprintf("Failed to get token: %v", err))
+		return "", err
+	}
+
+	token, err := base64.StdEncoding.DecodeString(string(tokenBytes))
+	if err != nil {
+		printError(fmt.Sprintf("Failed to decode token: %v", err))
+		return "", err
+	}
+
+	return string(token), nil
+}
+
+func createServiceAccount(backendConfig *BackendConfig) error {
+	printStatus("Creating service account and RBAC resources...")
+
+	// Role YAML
+	roleYAML := `apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sb-tasks
+rules:
+- apiGroups: ["tekton.dev"]
+  resources: ["taskruns", "pipelineruns"]
+  verbs: ["get", "watch", "list", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["configmaps", "secrets", "persistentvolumeclaims", "pods", "pods/log"]
+  verbs: ["get", "watch", "list"]`
+
+	// Service Account YAML
+	saYAML := `apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tasks-runner`
+
+	// Token Secret YAML
+	tokenYAML := `apiVersion: v1
+kind: Secret
+metadata:
+  name: tasks-runner-token
+  annotations:
+    kubernetes.io/service-account.name: tasks-runner
+type: kubernetes.io/service-account-token`
+
+	// Role Binding YAML
+	bindingYAML := `apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sb-tasks-runner
+subjects:
+- kind: ServiceAccount
+  name: tasks-runner
+roleRef:
+  kind: Role
+  name: sb-tasks
+  apiGroup: rbac.authorization.k8s.io`
+
+	// Create temporary files and apply each resource
+	for name, content := range map[string]string{
+		"role.yaml":    roleYAML,
+		"sa.yaml":      saYAML,
+		"token.yaml":   tokenYAML,
+		"binding.yaml": bindingYAML,
+	} {
+		tmpfile, err := os.CreateTemp("", name)
+		if err != nil {
+			printError(fmt.Sprintf("Failed to create temp file: %v", err))
+			return err
+		}
+		defer os.Remove(tmpfile.Name())
+
+		if _, err := tmpfile.WriteString(content); err != nil {
+			printError(fmt.Sprintf("Failed to write YAML: %v", err))
+			return err
+		}
+		tmpfile.Close()
+
+		if err := runCommand("kubectl", "apply", "-f", tmpfile.Name(), "-n", "shapeblock"); err != nil {
+			printError(fmt.Sprintf("Failed to apply %s: %v", name, err))
+			return err
+		}
+	}
+
+	// Get and store the token
+	token, err := getServiceAccountToken()
+	if err != nil {
+		return fmt.Errorf("failed to get service account token: %v", err)
+	}
+	backendConfig.ServiceAccountToken = token
+
+	printStatus("Service account and RBAC resources created successfully")
+	return nil
+}
+
+func getNodeIP() (string, error) {
+	cmd := exec.Command("hostname", "-I")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to get IP: %v", err)
+	}
+	// Get first IP address
+	ip := strings.Fields(string(output))[0]
+	return ip, nil
+}
+
+func generatePassword() string {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*"
+	length := 16
+	b := make([]byte, length)
+	for i := range b {
+		b[i] = charset[rand.Intn(len(charset))]
+	}
+	return string(b)
+}
+
+func installEpinio(config *Config, backendConfig *BackendConfig) error {
+	printStatus("Installing Epinio...")
+
+	// Add Epinio helm repo
+	if err := runCommand("helm", "repo", "add", "epinio", "https://epinio.github.io/helm-charts"); err != nil {
+		printError(fmt.Sprintf("Failed to add epinio repo: %v", err))
+		return err
+	}
+
+	if err := runCommand("helm", "repo", "update"); err != nil {
+		printError(fmt.Sprintf("Failed to update helm repos: %v", err))
+		return err
+	}
+
+	// Determine domain
+	var domain string
+	if config.DomainName != "" {
+		domain = config.DomainName
+	} else {
+		ip, err := getNodeIP()
+		if err != nil {
+			return err
+		}
+		domain = fmt.Sprintf("%s.nip.io", ip)
+	}
+
+	// Set Epinio credentials
+	backendConfig.EpinioUsername = "shapeblock"
+	backendConfig.EpinioPassword = generatePassword()
+
+	printStatus(fmt.Sprintf("Generated Epinio password: %s", backendConfig.EpinioPassword))
+	logMessage("INFO", fmt.Sprintf("Epinio credentials - username: %s, password: %s",
+		backendConfig.EpinioUsername, backendConfig.EpinioPassword))
+
+	// Create values.yaml
+	values := fmt.Sprintf(`
+global:
+  domain: %s
+  tlsIssuer: letsencrypt-prod
+  tlsIssuerEmail: %s
+  dex:
+    enabled: false
+ingress:
+  ingressClassName: nginx
+api:
+  users:
+    - username: %s
+      password: %s
+      roles: ["admin"]
+epinioUI:
+  enabled: false
+`, domain, config.AdminEmail, backendConfig.EpinioUsername, backendConfig.EpinioPassword)
+
+	// Write values to temporary file
+	tmpfile, err := os.CreateTemp("", "epinio-values-*.yaml")
+	if err != nil {
+		printError(fmt.Sprintf("Failed to create temp file: %v", err))
+		return err
+	}
+	defer os.Remove(tmpfile.Name())
+
+	if _, err := tmpfile.WriteString(values); err != nil {
+		printError(fmt.Sprintf("Failed to write values: %v", err))
+		return err
+	}
+	tmpfile.Close()
+
+	// Install Epinio
+	if err := runCommand("helm", "upgrade", "--install",
+		"epinio", "epinio/epinio",
+		"--version", "1.11.1",
+		"--namespace", "epinio",
+		"--create-namespace",
+		"--values", tmpfile.Name(),
+		"--timeout", "600s"); err != nil {
+		printError(fmt.Sprintf("Failed to install Epinio: %v", err))
+		return err
+	}
+
+	return nil
+}
+
 func install(config *Config) error {
+	backendConfig := &BackendConfig{}
+
 	if err := checkMemory(); err != nil {
 		return err
 	}
@@ -519,6 +731,14 @@ func install(config *Config) error {
 
 	if err := installTektonResources(); err != nil {
 		return fmt.Errorf("failed to install Tekton resources: %v", err)
+	}
+
+	if err := createServiceAccount(backendConfig); err != nil {
+		return fmt.Errorf("failed to create service account: %v", err)
+	}
+
+	if err := installEpinio(config, backendConfig); err != nil {
+		return fmt.Errorf("failed to install Epinio: %v", err)
 	}
 
 	return nil

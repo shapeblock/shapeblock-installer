@@ -7,6 +7,8 @@
 - setup tekton tasks and pipelines
 - setup service accounts for tekton
 - install epinio
+- redis
+- postgres
 - install shapeblock backend
 - install shapeblock frontend
 - print instructions
