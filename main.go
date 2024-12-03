@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -84,15 +86,10 @@ func logMessage(level, msg string) {
 }
 
 type Config struct {
-	LicenseKey     string
-	AdminEmail     string
-	AdminPassword  string
-	DomainName     string
-	ConfigureEmail bool
-	SMTPHost       string
-	SMTPPort       string
-	SMTPUsername   string
-	SMTPPassword   string
+	LicenseKey    string
+	AdminEmail    string
+	AdminPassword string
+	DomainName    string
 }
 
 type BackendConfig struct {
@@ -920,7 +917,7 @@ func install(config *Config, backendConfig *BackendConfig) error {
 	printStatus("Checking if Kubernetes is already installed...")
 	if !resourceExists("node", "", "") {
 		printStatus("Kubernetes not found. Installing Kubernetes using k3sup...")
-		if err := runCommand("k3sup", "install", "--local"); err != nil {
+		if err := runCommand("k3sup", "install", "--local", "--k3s-extra-args", "'--disable traefik'"); err != nil {
 			return fmt.Errorf("failed to install Kubernetes: %v", err)
 		}
 
@@ -988,6 +985,19 @@ func install(config *Config, backendConfig *BackendConfig) error {
 
 	if err := installBackend(config, backendConfig); err != nil {
 		return fmt.Errorf("failed to install shapeblock backend: %v", err)
+	}
+
+	// Add bootstrap step
+	if err := bootstrapBackend(config); err != nil {
+		return fmt.Errorf("failed to bootstrap backend: %v", err)
+	}
+
+	if err := installFrontend(config); err != nil {
+		return fmt.Errorf("failed to install frontend: %v", err)
+	}
+
+	if err := printInstructions(config); err != nil {
+		return fmt.Errorf("failed to print instructions: %v", err)
 	}
 
 	return nil
@@ -1064,73 +1074,9 @@ func collectInput(config *Config, backendConfig *BackendConfig) error {
 	}
 	config.DomainName = result
 
-	// Configure Email
-	configureEmailPrompt := promptui.Select{
-		Label: "Configure email settings?",
-		Items: []string{"Yes", "No"},
-	}
-	_, result, err = configureEmailPrompt.Run()
-	if err != nil {
-		return fmt.Errorf("prompt failed: %v", err)
-	}
-	config.ConfigureEmail = result == "Yes"
-
-	if config.ConfigureEmail {
-		// SMTP Host
-		prompt = promptui.Prompt{
-			Label:    "SMTP host",
-			Validate: validateRequired,
-		}
-		result, err = prompt.Run()
-		if err != nil {
-			return fmt.Errorf("prompt failed: %v", err)
-		}
-		config.SMTPHost = result
-
-		// SMTP Port
-		prompt = promptui.Prompt{
-			Label:    "SMTP port",
-			Validate: validateRequired,
-		}
-		result, err = prompt.Run()
-		if err != nil {
-			return fmt.Errorf("prompt failed: %v", err)
-		}
-		config.SMTPPort = result
-
-		// SMTP Username
-		prompt = promptui.Prompt{
-			Label:    "SMTP username",
-			Validate: validateRequired,
-		}
-		result, err = prompt.Run()
-		if err != nil {
-			return fmt.Errorf("prompt failed: %v", err)
-		}
-		config.SMTPUsername = result
-
-		// SMTP Password
-		prompt = promptui.Prompt{
-			Label:    "SMTP password",
-			Validate: validateRequired,
-			Mask:     '*',
-		}
-		result, err = prompt.Run()
-		if err != nil {
-			return fmt.Errorf("prompt failed: %v", err)
-		}
-		config.SMTPPassword = result
-	}
-
 	// Log collected information (excluding passwords)
 	logMessage("INFO", fmt.Sprintf("Admin email: %s", config.AdminEmail))
 	logMessage("INFO", fmt.Sprintf("Domain name: %s", config.DomainName))
-	logMessage("INFO", fmt.Sprintf("Configure email: %v", config.ConfigureEmail))
-	if config.ConfigureEmail {
-		logMessage("INFO", fmt.Sprintf("SMTP host: %s", config.SMTPHost))
-		logMessage("INFO", fmt.Sprintf("SMTP port: %s", config.SMTPPort))
-		logMessage("INFO", fmt.Sprintf("SMTP username: %s", config.SMTPUsername))
-	}
 
 	return nil
 }
@@ -1143,7 +1089,12 @@ func main() {
 	}
 
 	if len(os.Args) < 2 {
-		fmt.Println("expected 'install' subcommand")
+		fmt.Println("Usage:")
+		fmt.Println("  shapeblock-installer install")
+		fmt.Println("  shapeblock-installer update --be-image <backend-image-tag>")
+		fmt.Println("  shapeblock-installer update --fe-image <frontend-image-tag>")
+		fmt.Println("  shapeblock-installer update-license")
+		fmt.Println("  shapeblock-installer uninstall")
 		os.Exit(1)
 	}
 
@@ -1176,8 +1127,90 @@ func main() {
 			os.Exit(1)
 		}
 		logger.Printf("[%s] Installation completed successfully", time.Now().Format(logTimeFormat))
+
+	case "update":
+		if len(os.Args) != 4 {
+			fmt.Println("Usage: shapeblock-installer update [--be-image <backend-image-tag> | --fe-image <frontend-image-tag>]")
+			os.Exit(1)
+		}
+
+		switch os.Args[2] {
+		case "--be-image":
+			if err := updateBackend(os.Args[3], ""); err != nil {
+				printError(fmt.Sprintf("Failed to update backend: %v", err))
+				logger.Printf("[%s] Update failed: %v", time.Now().Format(logTimeFormat), err)
+				os.Exit(1)
+			}
+			logger.Printf("[%s] Backend update completed successfully", time.Now().Format(logTimeFormat))
+
+		case "--fe-image":
+			if err := updateFrontend(os.Args[3]); err != nil {
+				printError(fmt.Sprintf("Failed to update frontend: %v", err))
+				logger.Printf("[%s] Update failed: %v", time.Now().Format(logTimeFormat), err)
+				os.Exit(1)
+			}
+			logger.Printf("[%s] Frontend update completed successfully", time.Now().Format(logTimeFormat))
+
+		default:
+			fmt.Printf("Unknown flag: %s\n", os.Args[2])
+			fmt.Println("Usage: shapeblock-installer update [--be-image <backend-image-tag> | --fe-image <frontend-image-tag>]")
+			os.Exit(1)
+		}
+
+	case "update-license":
+		// Collect new license information
+		prompt := promptui.Prompt{
+			Label:    "New License key",
+			Validate: validateRequired,
+		}
+		licenseKey, err := prompt.Run()
+		if err != nil {
+			printError(fmt.Sprintf("Failed to collect license key: %v", err))
+			os.Exit(1)
+		}
+
+		prompt = promptui.Prompt{
+			Label:    "Admin email",
+			Validate: validateEmail,
+		}
+		email, err := prompt.Run()
+		if err != nil {
+			printError(fmt.Sprintf("Failed to collect email: %v", err))
+			os.Exit(1)
+		}
+
+		// TODO: check if email matches SB initial license
+		// Validate and activate the new license
+		if err := validateAndActivateLicense(email, licenseKey); err != nil {
+			printError(fmt.Sprintf("License validation failed: %v", err))
+			logger.Printf("[%s] License update failed: %v", time.Now().Format(logTimeFormat), err)
+			os.Exit(1)
+		}
+
+		// Update backend with new license
+		if err := updateBackend("", licenseKey); err != nil {
+			printError(fmt.Sprintf("Failed to update backend with new license: %v", err))
+			logger.Printf("[%s] License update failed: %v", time.Now().Format(logTimeFormat), err)
+			os.Exit(1)
+		}
+		logger.Printf("[%s] License update completed successfully", time.Now().Format(logTimeFormat))
+
+	case "uninstall":
+		if err := uninstall(); err != nil {
+			printError(fmt.Sprintf("Uninstallation failed: %v", err))
+			logger.Printf("[%s] Uninstallation failed: %v", time.Now().Format(logTimeFormat), err)
+			os.Exit(1)
+		}
+		logger.Printf("[%s] Uninstallation completed successfully", time.Now().Format(logTimeFormat))
+
 	default:
 		fmt.Printf("unknown subcommand: %s\n", os.Args[1])
+		fmt.Println("Usage:")
+		fmt.Println("  shapeblock-installer install")
+		fmt.Println("  shapeblock-installer update --be-image <backend-image-tag>")
+		fmt.Println("  shapeblock-installer update --fe-image <frontend-image-tag>")
+		fmt.Println("  shapeblock-installer update-license")
+		fmt.Println("  shapeblock-installer uninstall")
 		logger.Printf("[%s] Unknown subcommand: %s", time.Now().Format(logTimeFormat), os.Args[1])
 		os.Exit(1)
 	}
@@ -1360,7 +1393,7 @@ func generateBackendValues(config *Config, backendConfig *BackendConfig) (string
 	// Create the values template
 	valuesTemplate := `
 defaultImage: ghcr.io/shapeblock/backend
-defaultImageTag: v1.0.6-dec-03.1
+defaultImageTag: v1.0.6-dec-03.10
 defaultImagePullPolicy: Always
 
 deployments:
@@ -1508,7 +1541,57 @@ ingresses:
 	return values, nil
 }
 
+func updateBackend(imageTag, licenseKey string) error {
+	printStatus("Updating backend configuration...")
+
+	// Create minimal values for update
+	minimalValues := "defaultImageTag: " + imageTag + "\n"
+	if licenseKey != "" {
+		minimalValues += fmt.Sprintf(`
+envs:
+  DEPLOYMENT_MODE: "single-tenant"
+
+secretEnvs:
+  LICENSE_KEY: "%s"
+`, licenseKey)
+	}
+
+	// Write minimal values to temporary file
+	tmpfile, err := os.CreateTemp("", "backend-values-*.yaml")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	if _, err := tmpfile.WriteString(minimalValues); err != nil {
+		return fmt.Errorf("failed to write values: %v", err)
+	}
+	tmpfile.Close()
+
+	// Update using helm with --reuse-values to preserve existing configuration
+	if err := runCommand("helm", "upgrade",
+		"backend", "nixys/universal-chart",
+		"--namespace", "shapeblock",
+		"--reuse-values",
+		"--values", tmpfile.Name(),
+		"--timeout", "600s"); err != nil {
+		return fmt.Errorf("failed to update backend: %v", err)
+	}
+
+	printStatus("Backend configuration updated successfully")
+	return nil
+}
+
 func installBackend(config *Config, backendConfig *BackendConfig) error {
+	printStatus("Checking ShapeBlock backend installation...")
+
+	// Check if backend service exists
+	if resourceExists("service", "production-shapeblock-backend", "shapeblock") {
+		printStatus("Backend already installed")
+		return nil
+	}
+
+	// If backend doesn't exist, proceed with full installation
 	printStatus("Installing ShapeBlock backend...")
 
 	// Add nixys helm repo
@@ -1547,5 +1630,458 @@ func installBackend(config *Config, backendConfig *BackendConfig) error {
 		return fmt.Errorf("failed to install backend: %v", err)
 	}
 
+	return nil
+}
+
+func bootstrapBackend(config *Config) error {
+	printStatus("Bootstrapping backend configuration...")
+
+	// Get machine IP
+	ip, err := getNodeIP()
+	if err != nil {
+		return fmt.Errorf("failed to get node IP: %v", err)
+	}
+
+	// Read kubeconfig file
+	kubeconfig, err := os.ReadFile("/etc/rancher/k3s/k3s.yaml")
+	if err != nil {
+		return fmt.Errorf("failed to read kubeconfig: %v", err)
+	}
+
+	// Prepare request payload
+	payload := map[string]interface{}{
+		"email":      config.AdminEmail,
+		"password":   config.AdminPassword,
+		"ip":         ip,
+		"kubeconfig": string(kubeconfig),
+	}
+
+	// Convert payload to JSON
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal payload: %v", err)
+	}
+
+	// Make the API call
+	domain := config.DomainName
+	if domain == "" {
+		domain = fmt.Sprintf("%s.nip.io", ip)
+	}
+	url := fmt.Sprintf("https://api.%s/api/auth/bootstrap/", domain)
+
+	// Create custom HTTP client that skips SSL verification
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	client := &http.Client{Transport: tr}
+
+	resp, err := client.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("bootstrap request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Parse response
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("failed to decode response: %v", err)
+	}
+
+	publicKey, ok := result["public_key"].(string)
+	if !ok {
+		return fmt.Errorf("public key not found in response")
+	}
+
+	// Ensure .ssh directory exists
+	sshDir := filepath.Join(os.Getenv("HOME"), ".ssh")
+	if err := os.MkdirAll(sshDir, 0700); err != nil {
+		return fmt.Errorf("failed to create .ssh directory: %v", err)
+	}
+
+	// Check if authorized_keys exists and read last line
+	authorizedKeysPath := filepath.Join(sshDir, "authorized_keys")
+	var lastLine string
+	if content, err := os.ReadFile(authorizedKeysPath); err == nil && len(content) > 0 {
+		lines := strings.Split(strings.TrimSpace(string(content)), "\n")
+		if len(lines) > 0 {
+			lastLine = lines[len(lines)-1]
+		}
+	}
+
+	// Only append if the key is different from the last line
+	if lastLine != publicKey {
+		// Append public key to authorized_keys
+		f, err := os.OpenFile(authorizedKeysPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		if err != nil {
+			return fmt.Errorf("failed to open authorized_keys: %v", err)
+		}
+		defer f.Close()
+
+		if _, err := f.WriteString(publicKey + "\n"); err != nil {
+			return fmt.Errorf("failed to write public key: %v", err)
+		}
+		printStatus("Added new public key to authorized_keys")
+	} else {
+		printStatus("Public key already exists in authorized_keys")
+	}
+
+	printStatus("Backend bootstrapped successfully")
+	return nil
+}
+
+func installFrontend(config *Config) error {
+	printStatus("Installing ShapeBlock frontend...")
+
+	// Check if frontend service exists
+	if resourceExists("service", "frontend-console", "shapeblock") {
+		printStatus("Frontend already installed")
+		return nil
+	}
+
+	// Get domain or use IP if not set
+	domain := config.DomainName
+	if domain == "" {
+		ip, err := getNodeIP()
+		if err != nil {
+			return err
+		}
+		domain = fmt.Sprintf("%s.nip.io", ip)
+	}
+
+	// Create values.yaml content
+	values := fmt.Sprintf(`
+defaultImage: ghcr.io/shapeblock/frontend
+defaultImageTag: v1.0.6-dec-03.2
+defaultImagePullPolicy: Always
+
+deployments:
+  console:
+    containers:
+    - envConfigmaps:
+      - envs
+    - name: console
+      ports:
+      - containerPort: 3000
+        name: app
+      resources:
+        limits:
+          cpu: "1"
+          memory: 2Gi
+        requests:
+          cpu: 5m
+          memory: 128M
+      readinessProbe:
+        httpGet:
+          path: /
+          port: 3000
+        initialDelaySeconds: 180
+        periodSeconds: 10
+    podLabels:
+      app: shapeblock
+      release: frontend
+    replicas: 1
+
+envs:
+  NEXT_PUBLIC_API_URL: https://api.%s
+  NEXT_PUBLIC_WEBSOCKET_URL: wss://api.%s
+  NEXT_PUBLIC_SAAS_NAME: "ShapeBlock FCL"
+
+generic:
+  labels:
+    app: shapeblock
+    release: frontend
+  usePredefinedAffinity: false
+
+releasePrefix: frontend
+
+services:
+  console:
+    extraSelectorLabels:
+      app: shapeblock
+      release: frontend
+    ports:
+    - port: 3000
+    type: ClusterIP
+
+ingresses:
+  console.%s:
+    annotations:
+      nginx.ingress.kubernetes.io/proxy-body-size: 50m
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    certManager:
+      originalIssuerName: letsencrypt-prod
+      issuerType: cluster-issuer
+    hosts:
+    - paths:
+      - serviceName: console
+        servicePort: 3000
+    ingressClassName: nginx
+    name: frontend
+`, domain, domain, domain)
+
+	// Write values to temporary file
+	tmpfile, err := os.CreateTemp("", "frontend-values-*.yaml")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	if _, err := tmpfile.WriteString(values); err != nil {
+		return fmt.Errorf("failed to write values: %v", err)
+	}
+	tmpfile.Close()
+
+	// Install using helm
+	if err := runCommand("helm", "upgrade", "--install",
+		"frontend", "nixys/universal-chart",
+		"--namespace", "shapeblock",
+		"--values", tmpfile.Name(),
+		"--timeout", "600s"); err != nil {
+		return fmt.Errorf("failed to install frontend: %v", err)
+	}
+
+	printStatus("Frontend installed successfully")
+	return nil
+}
+
+func updateFrontend(imageTag string) error {
+	printStatus("Updating frontend configuration...")
+
+	// Create minimal values for update
+	minimalValues := "defaultImageTag: " + imageTag + "\n"
+
+	// Write minimal values to temporary file
+	tmpfile, err := os.CreateTemp("", "frontend-values-*.yaml")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	if _, err := tmpfile.WriteString(minimalValues); err != nil {
+		return fmt.Errorf("failed to write values: %v", err)
+	}
+	tmpfile.Close()
+
+	// Update using helm with --reuse-values to preserve existing configuration
+	if err := runCommand("helm", "upgrade",
+		"frontend", "nixys/universal-chart",
+		"--namespace", "shapeblock",
+		"--reuse-values",
+		"--values", tmpfile.Name(),
+		"--timeout", "600s"); err != nil {
+		return fmt.Errorf("failed to update frontend: %v", err)
+	}
+
+	printStatus("Frontend configuration updated successfully")
+	return nil
+}
+
+func printInstructions(config *Config) error {
+	domain := config.DomainName
+	if domain == "" {
+		ip, err := getNodeIP()
+		if err != nil {
+			return fmt.Errorf("failed to get node IP: %v", err)
+		}
+		domain = fmt.Sprintf("%s.nip.io", ip)
+	}
+
+	instructions := fmt.Sprintf(`
+ShapeBlock Installation Complete!
+
+Frontend Access:
+- URL: https://console.%s
+- Email: %s
+- Password: <password provided during installation>
+
+Admin Backend Access:
+- URL: https://api.%s/admin-sb-4891/
+- Username: admin
+- Password: <password provided during installation>
+`, domain, config.AdminEmail, domain)
+
+	// Print to console
+	fmt.Println(instructions)
+
+	// Write to file
+	if err := os.WriteFile("instructions.txt", []byte(instructions), 0644); err != nil {
+		return fmt.Errorf("failed to write instructions file: %v", err)
+	}
+
+	return nil
+}
+
+func uninstall() error {
+	// Prompt for confirmation
+	prompt := promptui.Prompt{
+		Label:   "Are you sure you want to uninstall ShapeBlock? [yes/no]",
+		Default: "no",
+		Validate: func(input string) error {
+			if input != "yes" && input != "no" {
+				return errors.New("please enter 'yes' or 'no'")
+			}
+			return nil
+		},
+	}
+	confirmation, err := prompt.Run()
+	if err != nil {
+		return fmt.Errorf("prompt failed: %v", err)
+	}
+	if confirmation != "yes" {
+		return fmt.Errorf("uninstall cancelled")
+	}
+
+	// Prompt for license key with regex validation
+	licensePattern := `^[A-F0-9]{6}-[A-F0-9]{6}-[A-F0-9]{6}-[A-F0-9]{6}-[A-F0-9]{6}-V3$`
+	prompt = promptui.Prompt{
+		Label: "License key",
+		Validate: func(input string) error {
+			matched, err := regexp.MatchString(licensePattern, input)
+			if err != nil {
+				return fmt.Errorf("failed to validate license: %v", err)
+			}
+			if !matched {
+				return fmt.Errorf("invalid license format")
+			}
+			return nil
+		},
+	}
+	licenseKey, err := prompt.Run()
+	if err != nil {
+		return fmt.Errorf("prompt failed: %v", err)
+	}
+
+	// Deactivate license
+	printStatus("Deactivating license...")
+
+	// Get machine ID
+	getMachineURL := "https://api.keygen.sh/v1/accounts/53666519-ebe7-4ca2-9c1a-d026831e4b56/machines?limit=1"
+	req, err := http.NewRequest("GET", getMachineURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %v", err)
+	}
+	req.Header.Set("Accept", "application/vnd.api+json")
+	req.Header.Set("Authorization", "License "+licenseKey)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to get machine ID: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("failed to decode response: %v", err)
+	}
+
+	data, ok := result["data"].([]interface{})
+	if !ok || len(data) == 0 {
+		return fmt.Errorf("no machines found for this license")
+	}
+
+	machineData, ok := data[0].(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("invalid machine data format")
+	}
+
+	machineID, ok := machineData["id"].(string)
+	if !ok {
+		return fmt.Errorf("machine ID not found")
+	}
+
+	// Delete machine
+	deleteMachineURL := fmt.Sprintf("https://api.keygen.sh/v1/accounts/53666519-ebe7-4ca2-9c1a-d026831e4b56/machines/%s", machineID)
+	req, err = http.NewRequest("DELETE", deleteMachineURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create delete request: %v", err)
+	}
+	req.Header.Set("Accept", "application/vnd.api+json")
+	req.Header.Set("Authorization", "License "+licenseKey)
+
+	resp, err = client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to deactivate license: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 204 {
+		return fmt.Errorf("failed to deactivate license: unexpected status code %d", resp.StatusCode)
+	}
+
+	printStatus("License deactivated successfully")
+
+	// Continue with uninstallation
+	printStatus("Starting ShapeBlock uninstallation...")
+
+	// Uninstall frontend
+	printStatus("Uninstalling frontend...")
+	if err := runCommand("helm", "uninstall", "frontend", "-n", "shapeblock"); err != nil {
+		printStatus("Note: Frontend was not installed or already removed")
+	}
+
+	// Uninstall backend
+	printStatus("Uninstalling backend...")
+	if err := runCommand("helm", "uninstall", "backend", "-n", "shapeblock"); err != nil {
+		printStatus("Note: Backend was not installed or already removed")
+	}
+
+	// Uninstall PostgreSQL instances
+	printStatus("Uninstalling PostgreSQL instances...")
+	for _, instance := range []string{"db", "tfstate"} {
+		if err := runCommand("helm", "uninstall", instance, "-n", "shapeblock"); err != nil {
+			printStatus(fmt.Sprintf("Note: PostgreSQL instance %s was not installed or already removed", instance))
+		}
+	}
+
+	// Uninstall Redis
+	printStatus("Uninstalling Redis...")
+	if err := runCommand("helm", "uninstall", "redis", "-n", "shapeblock"); err != nil {
+		printStatus("Note: Redis was not installed or already removed")
+	}
+
+	// Uninstall cert-manager
+	printStatus("Uninstalling cert-manager...")
+	if err := runCommand("helm", "uninstall", "cert-manager", "-n", "cert-manager"); err != nil {
+		printStatus("Note: cert-manager was not installed or already removed")
+	}
+
+	// Uninstall ingress-nginx
+	printStatus("Uninstalling ingress-nginx...")
+	if err := runCommand("helm", "uninstall", "ingress-nginx", "-n", "ingress-nginx"); err != nil {
+		printStatus("Note: ingress-nginx was not installed or already removed")
+	}
+
+	// Uninstall k3s
+	printStatus("Uninstalling k3s...")
+	if _, err := os.Stat("/usr/local/bin/k3s-uninstall.sh"); os.IsNotExist(err) {
+		printStatus("Note: k3s is already uninstalled")
+	} else if err != nil {
+		return fmt.Errorf("failed to check k3s uninstall script: %v", err)
+	} else {
+		if err := runCommand("/usr/local/bin/k3s-uninstall.sh"); err != nil {
+			return fmt.Errorf("failed to uninstall k3s: %v", err)
+		}
+	}
+
+	// Remove k3sup, helm, and kubectl
+	printStatus("Removing installation tools...")
+	tools := []string{
+		"/usr/local/bin/k3sup",
+		"/usr/local/bin/helm",
+		"/usr/local/bin/kubectl",
+	}
+
+	for _, tool := range tools {
+		if err := os.Remove(tool); err != nil {
+			if !os.IsNotExist(err) {
+				printStatus(fmt.Sprintf("Warning: Failed to remove %s: %v", tool, err))
+			}
+		} else {
+			printStatus(fmt.Sprintf("Removed %s", tool))
+		}
+	}
+
+	printStatus("ShapeBlock has been successfully uninstalled")
 	return nil
 }
