@@ -493,7 +493,7 @@ func installTektonResources() error {
 		tmpfile.Close()
 
 		// Apply the resource
-		if err := runCommand("kubectl", "apply", "-f", tmpfile.Name()); err != nil {
+		if err := runCommand("kubectl", "apply", "-f", tmpfile.Name(), "-n", "shapeblock"); err != nil {
 			printError(fmt.Sprintf("Failed to install Tekton resource %s: %v", resource, err))
 			return err
 		}
@@ -734,7 +734,7 @@ func installPostgres(name, username, database string, backendConfig *BackendConf
 
 	// Store credentials based on instance name
 	switch name {
-	case "postgresql":
+	case "db":
 		backendConfig.PostgresUsername = username
 		backendConfig.PostgresDatabase = database
 		backendConfig.PostgresPassword = password
@@ -746,9 +746,9 @@ func installPostgres(name, username, database string, backendConfig *BackendConf
 		backendConfig.TFStateRootPW = rootPW
 	}
 
-	// Log the credentials
-	logMessage("INFO", fmt.Sprintf("PostgreSQL %s credentials - username: %s, database: %s",
-		name, username, database))
+	// Log the credentials for debugging
+	logMessage("INFO", fmt.Sprintf("PostgreSQL %s credentials - username: %s, database: %s, password: %s",
+		name, username, database, password))
 
 	// Create values.yaml
 	values := fmt.Sprintf(`
@@ -1353,10 +1353,14 @@ func generateBackendValues(config *Config, backendConfig *BackendConfig) (string
 		domain = fmt.Sprintf("%s.nip.io", ip)
 	}
 
+	// Log the values being used for debugging
+	logMessage("INFO", fmt.Sprintf("Using PostgreSQL credentials - Username: %s, Database: %s",
+		backendConfig.PostgresUsername, backendConfig.PostgresDatabase))
+
 	// Create the values template
 	valuesTemplate := `
 defaultImage: ghcr.io/shapeblock/backend
-defaultImageTag: v1.0.6-dec-03
+defaultImageTag: v1.0.6-dec-03.1
 defaultImagePullPolicy: Always
 
 deployments:
@@ -1420,12 +1424,12 @@ deployments:
 
 envs:
   DEBUG: "False"
-  DATABASE_URL: postgres://%s:%s@db-postgresql/%s
-  POSTGRES_DB: %s
-  POSTGRES_USER: %s
-  POSTGRES_PASSWORD: %s
-  DATABASE_HOST: db-postgresql
-  REDIS_HOST: redis-master
+  DATABASE_URL: "postgres://%s:%s@db-postgresql/%s"
+  POSTGRES_DB: "%s"
+  POSTGRES_USER: "%s"
+  POSTGRES_PASSWORD: "%s"
+  DATABASE_HOST: "db-postgresql"
+  REDIS_HOST: "redis-master"
   ADMIN_URL: "admin-sb-4891/"
   SB_TLD: "%s"
   ALLOWED_HOSTS: api.%s
