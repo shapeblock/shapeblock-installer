@@ -12,9 +12,13 @@
 - postgres
 - tfstate postgres
 - terraform secret
+- install shapeblock backend
 
 # TODO
-- install shapeblock backend
+
+- add email config to backend
+- create an admin user with email and password.
+- bootstrap local cluster.
 - install shapeblock frontend
 - print instructions
 - write instructions to a file.

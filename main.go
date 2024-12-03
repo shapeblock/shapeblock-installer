@@ -2,14 +2,18 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 
@@ -81,7 +85,6 @@ func logMessage(level, msg string) {
 
 type Config struct {
 	LicenseKey     string
-	AdminUsername  string
 	AdminEmail     string
 	AdminPassword  string
 	DomainName     string
@@ -104,6 +107,7 @@ type BackendConfig struct {
 	TFStatePassword     string
 	TFStateDatabase     string
 	TFStateRootPW       string
+	LicenseKey          string
 }
 
 func printStatus(msg string) {
@@ -144,7 +148,8 @@ func (s *Spinner) Start() {
 			case <-s.stopChan:
 				return
 			case <-ticker.C:
-				fmt.Printf("\r%s %s", frames[i%len(frames)], s.message)
+				// Clear the line and move cursor to beginning
+				fmt.Printf("\r\033[K%s %s", frames[i%len(frames)], s.message)
 			}
 		}
 	}()
@@ -152,18 +157,28 @@ func (s *Spinner) Start() {
 
 func (s *Spinner) Stop() {
 	s.stopChan <- struct{}{}
-	fmt.Print("\r") // Clear the line
+	// Clear the line
+	fmt.Print("\r\033[K")
 }
 
 func runCommand(command string, args ...string) error {
-	spinner := NewSpinner(fmt.Sprintf("Running: %s %s", command, strings.Join(args, " ")))
+	// Append kubeconfig flag for kubectl and helm commands
+	if command == "kubectl" || command == "helm" {
+		args = append(args, "--kubeconfig=/etc/rancher/k3s/k3s.yaml")
+	}
+
+	// Print the command first
+	fmt.Printf("==> Running: %s %s\n", command, strings.Join(args, " "))
+
+	// Start spinner without the command text
+	spinner := NewSpinner("Processing...")
 	spinner.Start()
 	defer spinner.Stop()
 
 	cmd := exec.Command(command, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("command failed: %v\nOutput: %s", err, string(output))
+		return fmt.Errorf("command \"%s\" failed: %v\nOutput: %s", cmd, err, string(output))
 	}
 	return nil
 }
@@ -184,9 +199,8 @@ func checkMemory() error {
 		}
 	}
 
-	totalGB := totalKB / (1024 * 1024)
-	if totalGB < 4 {
-		return fmt.Errorf("insufficient memory. ShapeBlock requires at least 4GB RAM. Current: %dGB", totalGB)
+	if totalKB < 4000000 {
+		return fmt.Errorf("insufficient memory. ShapeBlock requires at least 4GB RAM. Current: %.1fGB", float64(totalKB)/1024/1024)
 	}
 
 	return nil
@@ -275,113 +289,12 @@ func installPrerequisites() error {
 		if err := runCommand("./k3sup_install.sh"); err != nil {
 			return fmt.Errorf("failed to install k3sup: %v", err)
 		}
-
-		// Move k3sup to /usr/local/bin
-		if err := runCommand("sudo", "install", "k3sup", "/usr/local/bin/"); err != nil {
-			return fmt.Errorf("failed to move k3sup to /usr/local/bin: %v", err)
-		}
-
 		// Clean up
 		if err := os.Remove("k3sup_install.sh"); err != nil {
 			printWarning(fmt.Sprintf("Failed to remove k3sup installation script: %v", err))
 		}
-		if err := os.Remove("k3sup"); err != nil {
-			printWarning(fmt.Sprintf("Failed to remove k3sup binary: %v", err))
-		}
 	}
 
-	return nil
-}
-
-func activateLicense(config *Config) error {
-	printStatus("Activating license...")
-
-	// Generate fingerprint from email
-	cmd := exec.Command("sh", "-c", fmt.Sprintf("echo -n '%s' | sha256sum | awk '{print $1}'", config.AdminEmail))
-	fingerprint, err := cmd.Output()
-	if err != nil {
-		return fmt.Errorf("failed to generate fingerprint: %v", err)
-	}
-
-	// Get license ID
-	req, err := http.NewRequest("GET", keygenBaseURL+"/me", nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Accept", "application/vnd.api+json")
-	req.Header.Set("Authorization", "License "+config.LicenseKey)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	var licenseResp struct {
-		Data struct {
-			ID string `json:"id"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&licenseResp); err != nil {
-		return err
-	}
-
-	// Activate license
-	activationPayload := struct {
-		Data struct {
-			Type       string `json:"type"`
-			Attributes struct {
-				Fingerprint string `json:"fingerprint"`
-			} `json:"attributes"`
-			Relationships struct {
-				License struct {
-					Data struct {
-						Type string `json:"type"`
-						ID   string `json:"id"`
-					} `json:"data"`
-				} `json:"license"`
-			} `json:"relationships"`
-		} `json:"data"`
-	}{}
-
-	activationPayload.Data.Type = "machines"
-	activationPayload.Data.Attributes.Fingerprint = string(fingerprint)
-	activationPayload.Data.Relationships.License.Data.Type = "licenses"
-	activationPayload.Data.Relationships.License.Data.ID = licenseResp.Data.ID
-
-	payloadBytes, err := json.Marshal(activationPayload)
-	if err != nil {
-		return err
-	}
-
-	req, err = http.NewRequest("POST", keygenBaseURL+"/machines", bytes.NewBuffer(payloadBytes))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/vnd.api+json")
-	req.Header.Set("Accept", "application/vnd.api+json")
-	req.Header.Set("Authorization", "License "+config.LicenseKey)
-
-	resp, err = http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("license activation failed with status: %d", resp.StatusCode)
-	}
-
-	printStatus("License activated successfully")
-	return nil
-}
-
-func createNamespace() error {
-	printStatus("Creating shapeblock namespace...")
-	if err := runCommand("kubectl", "create", "namespace", "shapeblock", "--dry-run=client", "-o", "yaml", "|", "kubectl", "apply", "-f", "-"); err != nil {
-		printError(fmt.Sprintf("Failed to create namespace: %v", err))
-		return err
-	}
 	return nil
 }
 
@@ -389,8 +302,7 @@ func addHelmRepo(name, url string) error {
 	printStatus(fmt.Sprintf("Adding helm repo %s...", name))
 
 	// Check if repo already exists
-	cmd := exec.Command("helm", "repo", "list")
-	output, _ := cmd.Output()
+	output, _ := exec.Command("helm", "repo", "list").Output()
 	if strings.Contains(string(output), name) {
 		printStatus(fmt.Sprintf("Helm repo %s already exists", name))
 		return nil
@@ -403,8 +315,15 @@ func addHelmRepo(name, url string) error {
 }
 
 func resourceExists(kind, name, namespace string) bool {
-	cmd := exec.Command("kubectl", "get", kind, name, "-n", namespace)
-	return cmd.Run() == nil
+	if kind == "node" {
+		// Nodes do not require a namespace
+		return runCommand("kubectl", "get", kind) == nil
+	}
+	if kind == "clusterissuer" {
+		// Cluster issuers do not require a namespace
+		return runCommand("kubectl", "get", kind, name) == nil
+	}
+	return runCommand("kubectl", "get", kind, name, "-n", namespace) == nil
 }
 
 func installNginxIngress() error {
@@ -452,6 +371,11 @@ func installCertManager() error {
 }
 
 func installClusterIssuer(email string) error {
+	if resourceExists("clusterissuer", "letsencrypt-prod", "") {
+		printStatus("ClusterIssuer already installed")
+		return nil
+	}
+
 	printStatus("Installing ClusterIssuer...")
 
 	// Wait for cert-manager to be ready
@@ -503,14 +427,14 @@ func installTekton() error {
 		return nil
 	}
 
-	printStatus("Installing Tekton...")
-
 	// Define versions
 	tektonVersion := "v0.74.0"
 	dashboardVersion := "v0.52.0"
 
+	printStatus(fmt.Sprintf("Installing Tekton %s and Dashboard %s...", tektonVersion, dashboardVersion))
+
 	// Install Tekton Pipelines
-	releaseURL := fmt.Sprintf("https://storage.googleapis.com/tekton-releases/pipeline/previous/%s/release.yaml", tektonVersion)
+	releaseURL := fmt.Sprintf("https://storage.googleapis.com/tekton-releases/operator/previous/%s/release.yaml", tektonVersion)
 	if err := runCommand("kubectl", "apply", "-f", releaseURL); err != nil {
 		printError(fmt.Sprintf("Failed to install Tekton: %v", err))
 		return fmt.Errorf("failed to install Tekton: %v", err)
@@ -579,15 +503,13 @@ func installTektonResources() error {
 }
 
 func getServiceAccountToken() (string, error) {
-	cmd := exec.Command("kubectl", "get", "secret", "tasks-runner-token", "-n", "shapeblock",
-		"-o", "jsonpath={.data.token}")
-	tokenBytes, err := cmd.Output()
+	output, err := exec.Command("kubectl", "get", "secret", "tasks-runner-token", "-n", "shapeblock", "-o", "jsonpath={.data.token}", "--kubeconfig=/etc/rancher/k3s/k3s.yaml").Output()
 	if err != nil {
 		printError(fmt.Sprintf("Failed to get token: %v", err))
 		return "", err
 	}
 
-	token, err := base64.StdEncoding.DecodeString(string(tokenBytes))
+	token, err := base64.StdEncoding.DecodeString(string(output))
 	if err != nil {
 		printError(fmt.Sprintf("Failed to decode token: %v", err))
 		return "", err
@@ -671,7 +593,7 @@ roleRef:
 		}
 		tmpfile.Close()
 
-		if err := runCommand("kubectl", "apply", "-f", tmpfile.Name(), "-n", "shapeblock"); err != nil {
+		if err := runCommand("kubectl", "apply", "-f", tmpfile.Name(), "-n", "shapeblock", "--kubeconfig=/etc/rancher/k3s/k3s.yaml"); err != nil {
 			printError(fmt.Sprintf("Failed to apply %s: %v", name, err))
 			return err
 		}
@@ -689,8 +611,7 @@ roleRef:
 }
 
 func getNodeIP() (string, error) {
-	cmd := exec.Command("hostname", "-I")
-	output, err := cmd.Output()
+	output, err := exec.Command("hostname", "-I").Output()
 	if err != nil {
 		return "", fmt.Errorf("failed to get IP: %v", err)
 	}
@@ -710,7 +631,7 @@ func generatePassword() string {
 }
 
 func installEpinio(config *Config, backendConfig *BackendConfig) error {
-	if resourceExists("deployment", "epinio", "epinio") {
+	if resourceExists("deployment", "epinio-server", "epinio") {
 		printStatus("Epinio already installed")
 		return nil
 	}
@@ -798,7 +719,7 @@ epinioUI:
 func installPostgres(name, username, database string, backendConfig *BackendConfig) error {
 	printStatus(fmt.Sprintf("Installing PostgreSQL instance %s...", name))
 
-	if resourceExists("statefulset", name, "shapeblock") {
+	if resourceExists("statefulset", name+"-postgresql", "shapeblock") {
 		printStatus(fmt.Sprintf("PostgreSQL instance %s already installed", name))
 		return nil
 	}
@@ -892,7 +813,7 @@ func createTerraformSecret(backendConfig *BackendConfig) error {
 	if err := runCommand("kubectl", "create", "secret", "generic",
 		"terraform-creds",
 		fmt.Sprintf("--from-literal=PG_CONN_STR=%s", connStr),
-		"-n", "shapeblock"); err != nil {
+		"-n", "shapeblock", "--kubeconfig=/etc/rancher/k3s/k3s.yaml"); err != nil {
 		printError(fmt.Sprintf("Failed to create Terraform credentials secret: %v", err))
 		return err
 	}
@@ -904,7 +825,7 @@ func createTerraformSecret(backendConfig *BackendConfig) error {
 func installRedis() error {
 	printStatus("Installing Redis...")
 
-	if resourceExists("statefulset", "redis", "shapeblock") {
+	if resourceExists("statefulset", "redis-master", "shapeblock") {
 		printStatus("Redis already installed")
 		return nil
 	}
@@ -985,7 +906,7 @@ func installEpinioResources() error {
 		tmpfile.Close()
 
 		// Apply the resource
-		if err := runCommand("kubectl", "apply", "-f", tmpfile.Name()); err != nil {
+		if err := runCommand("kubectl", "apply", "-f", tmpfile.Name(), "--kubeconfig=/etc/rancher/k3s/k3s.yaml", "-n", "epinio"); err != nil {
 			printError(fmt.Sprintf("Failed to install Epinio resource %s: %v", resource, err))
 			return err
 		}
@@ -994,23 +915,24 @@ func installEpinioResources() error {
 	return nil
 }
 
-func install(config *Config) error {
-	backendConfig := &BackendConfig{}
+func install(config *Config, backendConfig *BackendConfig) error {
+	// Check if Kubernetes is already installed
+	printStatus("Checking if Kubernetes is already installed...")
+	if !resourceExists("node", "", "") {
+		printStatus("Kubernetes not found. Installing Kubernetes using k3sup...")
+		if err := runCommand("k3sup", "install", "--local"); err != nil {
+			return fmt.Errorf("failed to install Kubernetes: %v", err)
+		}
 
-	if err := checkMemory(); err != nil {
-		return err
+		// Wait a moment for the cluster to initialize
+		printStatus("Waiting for Kubernetes cluster to initialize...")
+		time.Sleep(10 * time.Second)
+	} else {
+		printStatus("Kubernetes is already installed")
 	}
 
 	if err := installPrerequisites(); err != nil {
 		return err
-	}
-
-	if err := activateLicense(config); err != nil {
-		return err
-	}
-
-	if err := createNamespace(); err != nil {
-		return fmt.Errorf("failed to create namespace: %v", err)
 	}
 
 	if err := installNginxIngress(); err != nil {
@@ -1042,7 +964,7 @@ func install(config *Config) error {
 	}
 
 	// Install main PostgreSQL instance
-	if err := installPostgres("postgresql", "shapeblock", "shapeblock", backendConfig); err != nil {
+	if err := installPostgres("db", "shapeblock", "shapeblock", backendConfig); err != nil {
 		return fmt.Errorf("failed to install main PostgreSQL: %v", err)
 	}
 
@@ -1062,6 +984,10 @@ func install(config *Config) error {
 
 	if err := installEpinioResources(); err != nil {
 		return fmt.Errorf("failed to install Epinio resources: %v", err)
+	}
+
+	if err := installBackend(config, backendConfig); err != nil {
+		return fmt.Errorf("failed to install shapeblock backend: %v", err)
 	}
 
 	return nil
@@ -1084,7 +1010,7 @@ func validateEmail(input string) error {
 	return nil
 }
 
-func collectInput(config *Config) error {
+func collectInput(config *Config, backendConfig *BackendConfig) error {
 	// License Key
 	prompt := promptui.Prompt{
 		Label:    "License key",
@@ -1096,17 +1022,6 @@ func collectInput(config *Config) error {
 	}
 	config.LicenseKey = result
 
-	// Admin Username
-	prompt = promptui.Prompt{
-		Label:    "Admin username",
-		Validate: validateRequired,
-	}
-	result, err = prompt.Run()
-	if err != nil {
-		return fmt.Errorf("prompt failed: %v", err)
-	}
-	config.AdminUsername = result
-
 	// Admin Email
 	prompt = promptui.Prompt{
 		Label:    "Admin email",
@@ -1117,6 +1032,10 @@ func collectInput(config *Config) error {
 		return fmt.Errorf("prompt failed: %v", err)
 	}
 	config.AdminEmail = result
+
+	if err := validateAndActivateLicense(config.AdminEmail, config.LicenseKey); err != nil {
+		return fmt.Errorf("license validation failed: %v", err)
+	}
 
 	// Admin Password
 	prompt = promptui.Prompt{
@@ -1204,7 +1123,6 @@ func collectInput(config *Config) error {
 	}
 
 	// Log collected information (excluding passwords)
-	logMessage("INFO", fmt.Sprintf("Admin username: %s", config.AdminUsername))
 	logMessage("INFO", fmt.Sprintf("Admin email: %s", config.AdminEmail))
 	logMessage("INFO", fmt.Sprintf("Domain name: %s", config.DomainName))
 	logMessage("INFO", fmt.Sprintf("Configure email: %v", config.ConfigureEmail))
@@ -1231,12 +1149,28 @@ func main() {
 
 	switch os.Args[1] {
 	case "install":
+		// Check memory first
+		if err := checkMemory(); err != nil {
+			printError(err.Error())
+			logger.Printf("[%s] Installation failed: %v", time.Now().Format(logTimeFormat), err)
+			os.Exit(1)
+		}
+
+		// Check prerequisites
+		if err := installPrerequisites(); err != nil {
+			printError(err.Error())
+			logger.Printf("[%s] Installation failed: %v", time.Now().Format(logTimeFormat), err)
+			os.Exit(1)
+		}
+
+		// Proceed with input collection and installation
 		var config Config
-		if err := collectInput(&config); err != nil {
+		var backendConfig BackendConfig
+		if err := collectInput(&config, &backendConfig); err != nil {
 			printError(fmt.Sprintf("Failed to collect input: %v", err))
 			os.Exit(1)
 		}
-		if err := install(&config); err != nil {
+		if err := install(&config, &backendConfig); err != nil {
 			printError(err.Error())
 			logger.Printf("[%s] Installation failed: %v", time.Now().Format(logTimeFormat), err)
 			os.Exit(1)
@@ -1247,4 +1181,367 @@ func main() {
 		logger.Printf("[%s] Unknown subcommand: %s", time.Now().Format(logTimeFormat), os.Args[1])
 		os.Exit(1)
 	}
+}
+
+func validateAndActivateLicense(email, licenseKey string) error {
+	// Regex pattern for license key
+	licensePattern := `^[A-F0-9]{6}-[A-F0-9]{6}-[A-F0-9]{6}-[A-F0-9]{6}-[A-F0-9]{6}-V3$`
+	matched, err := regexp.MatchString(licensePattern, licenseKey)
+	if err != nil {
+		return fmt.Errorf("failed to compile regex: %v", err)
+	}
+	if !matched {
+		return fmt.Errorf("invalid license format")
+	}
+
+	printStatus("Validating license...")
+
+	// Create fingerprint from email
+	// Shell equivalent: echo -n "$email" | sha256sum | awk '{print $1}'
+	fingerprint := sha256.Sum256([]byte(email))
+	fingerprintHex := hex.EncodeToString(fingerprint[:])
+
+	logMessage("INFO", fmt.Sprintf("Fingerprint: %s", fingerprintHex))
+	// First validate the license
+	validateURL := fmt.Sprintf("%s/licenses/actions/validate-key", keygenBaseURL)
+	validatePayload := map[string]interface{}{
+		"meta": map[string]interface{}{
+			"key": licenseKey,
+			"scope": map[string]interface{}{
+				"fingerprint": fingerprintHex,
+			},
+		},
+	}
+
+	resp, err := makeRequest("POST", validateURL, validatePayload, licenseKey)
+	if err != nil {
+		return fmt.Errorf("license validation failed: %v", err)
+	}
+
+	meta := resp["meta"].(map[string]interface{})
+	if meta["valid"].(bool) {
+		printStatus("License is valid and activated")
+		return nil
+	}
+
+	// Handle invalid license scenario
+	detail := meta["detail"].(string)
+	printError(fmt.Sprintf("Invalid license: %s", detail))
+	logMessage("ERROR", fmt.Sprintf("Invalid license: %s", detail))
+
+	// Check if we need to activate
+	if meta["code"] != "NO_MACHINE" {
+		return fmt.Errorf("invalid license: %s", detail)
+	}
+
+	// Get license ID using the /me endpoint
+	meURL := fmt.Sprintf("%s/me", keygenBaseURL)
+	licenseInfo, err := makeRequest("GET", meURL, nil, licenseKey)
+	if err != nil {
+		return fmt.Errorf("failed to get license info: %v", err)
+	}
+
+	licenseData := licenseInfo["data"].(map[string]interface{})
+	licenseID := licenseData["id"].(string)
+	status := licenseData["attributes"].(map[string]interface{})["status"].(string)
+
+	if status != "ACTIVE" {
+		return fmt.Errorf("license is not active (status: %s)", status)
+	}
+
+	printStatus("Activating license...")
+	// Activate the license by creating a machine
+	activateURL := fmt.Sprintf("%s/machines", keygenBaseURL)
+	activatePayload := map[string]interface{}{
+		"data": map[string]interface{}{
+			"type": "machines",
+			"attributes": map[string]interface{}{
+				"fingerprint": fingerprintHex,
+			},
+			"relationships": map[string]interface{}{
+				"license": map[string]interface{}{
+					"data": map[string]interface{}{
+						"type": "licenses",
+						"id":   licenseID,
+					},
+				},
+			},
+		},
+	}
+
+	_, err = makeRequest("POST", activateURL, activatePayload, licenseKey)
+	if err != nil {
+		return fmt.Errorf("license activation failed: %v", err)
+	}
+
+	printStatus("License activated successfully")
+
+	return nil
+}
+
+// Helper function to make HTTP requests
+func makeRequest(method, url string, payload interface{}, licenseKey string) (map[string]interface{}, error) {
+	var reqBody io.Reader
+	if payload != nil {
+		jsonData, err := json.Marshal(payload)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal request body: %v", err)
+		}
+		reqBody = bytes.NewBuffer(jsonData)
+	}
+
+	req, err := http.NewRequest(method, url, reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %v", err)
+	}
+
+	req.Header.Set("Content-Type", "application/vnd.api+json")
+	req.Header.Set("Accept", "application/vnd.api+json")
+	req.Header.Set("Authorization", "License "+licenseKey)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %v", err)
+	}
+
+	return result, nil
+}
+
+func generateSecretKey() string {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+"
+	length := 50
+	b := make([]byte, length)
+	for i := range b {
+		b[i] = charset[rand.Intn(len(charset))]
+	}
+	return string(b)
+}
+
+func generateFernetKeys() string {
+	// Generate two Fernet keys
+	key1 := make([]byte, 32)
+	key2 := make([]byte, 32)
+	rand.Read(key1)
+	rand.Read(key2)
+
+	// Encode them in base64 and join with comma
+	return fmt.Sprintf("%s,%s",
+		base64.URLEncoding.EncodeToString(key1),
+		base64.URLEncoding.EncodeToString(key2))
+}
+
+func generateBackendValues(config *Config, backendConfig *BackendConfig) (string, error) {
+	// Get domain or use IP if not set
+	domain := config.DomainName
+	if domain == "" {
+		ip, err := getNodeIP()
+		if err != nil {
+			return "", err
+		}
+		domain = fmt.Sprintf("%s.nip.io", ip)
+	}
+
+	// Create the values template
+	valuesTemplate := `
+defaultImage: ghcr.io/shapeblock/backend
+defaultImageTag: v1.0.6-dec-03
+defaultImagePullPolicy: Always
+
+deployments:
+  shapeblock-backend:
+    initContainers:
+    - name: migrate
+      command: ['python', 'manage.py', 'migrate']
+      envConfigmaps:
+      - envs
+      envSecrets:
+      - secret-envs
+      resources:
+        limits:
+          cpu: "500m"
+          memory: "512Mi"
+        requests:
+          cpu: 5m
+          memory: 128M
+
+    containers:
+    - envConfigmaps:
+      - envs
+      envSecrets:
+      - secret-envs
+      name: shapeblock-backend
+      command: ['uvicorn', '--host', '0.0.0.0', '--port', '8000', '--workers', '1', 'shapeblock.asgi:application']
+      ports:
+      - containerPort: 8000
+        name: app
+      resources:
+        limits:
+          cpu: "1"
+          memory: 2Gi
+        requests:
+          cpu: 5m
+          memory: 128M
+    podLabels:
+      app: shapeblock
+      release: backend
+    replicas: 1
+
+  worker:
+    containers:
+    - envConfigmaps:
+      - envs
+      envSecrets:
+      - secret-envs
+      name: worker
+      command: ['celery', '-A', 'shapeblock', 'worker', '-l', 'INFO']
+      resources:
+        limits:
+          cpu: "1"
+          memory: 2Gi
+        requests:
+          cpu: 5m
+          memory: 128M
+    podLabels:
+      app: shapeblock
+      release: backend
+    replicas: 1
+
+envs:
+  DEBUG: "False"
+  DATABASE_URL: postgres://%s:%s@db-postgresql/%s
+  POSTGRES_DB: %s
+  POSTGRES_USER: %s
+  POSTGRES_PASSWORD: %s
+  DATABASE_HOST: db-postgresql
+  REDIS_HOST: redis-master
+  ADMIN_URL: "admin-sb-4891/"
+  SB_TLD: "%s"
+  ALLOWED_HOSTS: api.%s
+  KUBE_SERVER: https://127.0.0.1:6443
+  KUBE_NAMESPACE: shapeblock
+  DEFAULT_FROM_EMAIL: %s
+  CELERY_BROKER_URL: "redis://redis-master:6379/0"
+  CORS_ALLOWED_ORIGINS: "https://console.%s"
+  FRONTEND_URL: "https://console.%s"
+  CUSTOM_PASSWORD_RESET_DOMAIN: "https://console.%s"
+  INVITATIONS_SIGNUP_REDIRECT: "https://console.%s/register"
+  DEPLOYMENT_MODE: "single-tenant"
+
+generic:
+  labels:
+    app: shapeblock
+    release: backend
+  usePredefinedAffinity: false
+
+releasePrefix: production
+
+secretEnvs:
+  SECRET_KEY: "%s"
+  KUBE_TOKEN: "%s"
+  FERNET_KEYS: "%s"
+  LICENSE_KEY: "%s"
+
+services:
+  shapeblock-backend:
+    extraSelectorLabels:
+      app: shapeblock
+      release: backend
+    ports:
+    - port: 8000
+    type: ClusterIP
+
+ingresses:
+  api.%s:
+    annotations:
+      nginx.ingress.kubernetes.io/proxy-body-size: 50m
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    certManager:
+      originalIssuerName: letsencrypt-prod
+      issuerType: cluster-issuer
+    hosts:
+    - paths:
+      - serviceName: shapeblock-backend
+        servicePort: 8000
+    ingressClassName: nginx
+    name: backend
+`
+	// Format the template with the required values
+	values := fmt.Sprintf(valuesTemplate,
+		backendConfig.PostgresUsername,
+		backendConfig.PostgresPassword,
+		backendConfig.PostgresDatabase,
+		backendConfig.PostgresDatabase,
+		backendConfig.PostgresUsername,
+		backendConfig.PostgresPassword,
+		domain,
+		domain,
+		config.AdminEmail,
+		domain,
+		domain,
+		domain,
+		domain,
+		generateSecretKey(),
+		backendConfig.ServiceAccountToken,
+		generateFernetKeys(),
+		config.LicenseKey,
+		domain,
+	)
+
+	return values, nil
+}
+
+func installBackend(config *Config, backendConfig *BackendConfig) error {
+	printStatus("Installing ShapeBlock backend...")
+
+	// Add nixys helm repo
+	if err := addHelmRepo("nixys", "https://registry.nixys.ru/chartrepo/public"); err != nil {
+		return err
+	}
+
+	// Generate values.yaml content
+	values, err := generateBackendValues(config, backendConfig)
+	if err != nil {
+		return fmt.Errorf("failed to generate backend values: %v", err)
+	}
+
+	// Log the values file content
+	logMessage("INFO", "Backend values.yaml content:")
+	logMessage("INFO", values)
+
+	// Write values to temporary file
+	tmpfile, err := os.CreateTemp("", "backend-values-*.yaml")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	if _, err := tmpfile.WriteString(values); err != nil {
+		return fmt.Errorf("failed to write values: %v", err)
+	}
+	tmpfile.Close()
+
+	// Install using helm
+	if err := runCommand("helm", "upgrade", "--install",
+		"backend", "nixys/universal-chart",
+		"--namespace", "shapeblock",
+		"--values", tmpfile.Name(),
+		"--timeout", "600s"); err != nil {
+		return fmt.Errorf("failed to install backend: %v", err)
+	}
+
+	return nil
 }
