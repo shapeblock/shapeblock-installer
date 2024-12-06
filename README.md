@@ -22,5 +22,6 @@
 - uninstall shapeblock
 
 # TODO
+- pull buildpack
 - update check versions(sb backend, sb frontend images)
 - udpate add cronjob on host

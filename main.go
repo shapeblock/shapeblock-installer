@@ -172,6 +172,18 @@ func runCommand(command string, args ...string) error {
 	spinner.Start()
 	defer spinner.Stop()
 
+	// Special handling for k3sup install command
+	if command == "k3sup" && len(args) > 0 && args[0] == "install" {
+		// Use shell to preserve single quotes
+		shellCmd := fmt.Sprintf("%s %s", command, strings.Join(args, " "))
+		cmd := exec.Command("sh", "-c", shellCmd)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("command \"%s\" failed: %v\nOutput: %s", shellCmd, err, string(output))
+		}
+		return nil
+	}
+
 	cmd := exec.Command(command, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -437,6 +449,10 @@ func installTekton() error {
 		return fmt.Errorf("failed to install Tekton: %v", err)
 	}
 
+	// Wait for Tekton to be ready
+	printStatus("Waiting 60 seconds for Tekton to be ready...")
+	time.Sleep(60 * time.Second)
+
 	// Install Tekton Dashboard
 	dashboardURL := fmt.Sprintf("https://storage.googleapis.com/tekton-releases/dashboard/previous/%s/release.yaml", dashboardVersion)
 	if err := runCommand("kubectl", "apply", "-f", dashboardURL); err != nil {
@@ -595,6 +611,9 @@ roleRef:
 			return err
 		}
 	}
+	// Wait for 10 seconds before getting the token
+	printStatus("Waiting 10 seconds for service account token to be created...")
+	time.Sleep(10 * time.Second)
 
 	// Get and store the token
 	token, err := getServiceAccountToken()
@@ -923,7 +942,7 @@ func install(config *Config, backendConfig *BackendConfig) error {
 
 		// Wait a moment for the cluster to initialize
 		printStatus("Waiting for Kubernetes cluster to initialize...")
-		time.Sleep(10 * time.Second)
+		time.Sleep(60 * time.Second)
 	} else {
 		printStatus("Kubernetes is already installed")
 	}
@@ -988,7 +1007,7 @@ func install(config *Config, backendConfig *BackendConfig) error {
 	}
 
 	// Add bootstrap step
-	if err := bootstrapBackend(config); err != nil {
+	if err := bootstrapBackend(config, backendConfig); err != nil {
 		return fmt.Errorf("failed to bootstrap backend: %v", err)
 	}
 
@@ -1259,12 +1278,23 @@ func validateAndActivateLicense(email, licenseKey string) error {
 
 	// Handle invalid license scenario
 	detail := meta["detail"].(string)
-	printError(fmt.Sprintf("Invalid license: %s", detail))
-	logMessage("ERROR", fmt.Sprintf("Invalid license: %s", detail))
 
+	// Assert the type of meta["code"] to string
+	code, ok := meta["code"].(string)
+	if !ok {
+		return fmt.Errorf("unexpected type for meta[\"code\"]")
+	}
+
+	printStatus(code)
 	// Check if we need to activate
-	if meta["code"] != "NO_MACHINE" {
-		return fmt.Errorf("invalid license: %s", detail)
+	if code != "NO_MACHINE" {
+		printError(fmt.Sprintf("Invalid license: %s", detail))
+		logMessage("ERROR", fmt.Sprintf("Invalid license: %s", detail))
+	}
+
+	if code == "TOO_MANY_MACHINES" {
+		printError("The validated license has exceeded its policy's machine limit.")
+		return nil
 	}
 
 	// Get license ID using the /me endpoint
@@ -1376,13 +1406,13 @@ func generateFernetKeys() string {
 }
 
 func generateBackendValues(config *Config, backendConfig *BackendConfig) (string, error) {
+	ip, err := getNodeIP()
+	if err != nil {
+		return "", err
+	}
 	// Get domain or use IP if not set
 	domain := config.DomainName
 	if domain == "" {
-		ip, err := getNodeIP()
-		if err != nil {
-			return "", err
-		}
 		domain = fmt.Sprintf("%s.nip.io", ip)
 	}
 
@@ -1393,7 +1423,7 @@ func generateBackendValues(config *Config, backendConfig *BackendConfig) (string
 	// Create the values template
 	valuesTemplate := `
 defaultImage: ghcr.io/shapeblock/backend
-defaultImageTag: v1.0.6-dec-03.10
+defaultImageTag: v1.0.6-dec-03.11
 defaultImagePullPolicy: Always
 
 deployments:
@@ -1430,6 +1460,7 @@ deployments:
         requests:
           cpu: 5m
           memory: 128M
+
     podLabels:
       app: shapeblock
       release: backend
@@ -1465,8 +1496,9 @@ envs:
   REDIS_HOST: "redis-master"
   ADMIN_URL: "admin-sb-4891/"
   SB_TLD: "%s"
+	SB_URL: "https://api.%s"
   ALLOWED_HOSTS: api.%s
-  KUBE_SERVER: https://127.0.0.1:6443
+  KUBE_SERVER: https://%s:6443
   KUBE_NAMESPACE: shapeblock
   DEFAULT_FROM_EMAIL: %s
   CELERY_BROKER_URL: "redis://redis-master:6379/0"
@@ -1526,6 +1558,8 @@ ingresses:
 		backendConfig.PostgresPassword,
 		domain,
 		domain,
+		domain,
+		ip,
 		config.AdminEmail,
 		domain,
 		domain,
@@ -1630,10 +1664,42 @@ func installBackend(config *Config, backendConfig *BackendConfig) error {
 		return fmt.Errorf("failed to install backend: %v", err)
 	}
 
-	return nil
+	// Wait for 60 seconds before checking readiness
+	printStatus("Waiting 60 seconds before checking backend readiness...")
+	time.Sleep(60 * time.Second)
+
+	// Check readiness by making a curl request
+	domain := config.DomainName
+	if domain == "" {
+		ip, err := getNodeIP()
+		if err != nil {
+			return fmt.Errorf("failed to get node IP: %v", err)
+		}
+		domain = fmt.Sprintf("%s.nip.io", ip)
+	}
+
+	readinessURL := fmt.Sprintf("https://api.%s/ready/", domain)
+	printStatus(fmt.Sprintf("Checking backend readiness at %s...", readinessURL))
+
+	maxRetries := 30 // 5 minutes total (10 second intervals)
+	for i := 0; i < maxRetries; i++ {
+		cmd := exec.Command("curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", readinessURL)
+		output, err := cmd.Output()
+		if err == nil && string(output) == "200" {
+			printStatus("Backend is ready")
+			return nil
+		}
+
+		time.Sleep(10 * time.Second)
+		if i < maxRetries-1 { // Don't print "still waiting" on last iteration
+			printStatus(fmt.Sprintf("Still waiting for backend readiness (attempt %d/%d)...", i+1, maxRetries))
+		}
+	}
+
+	return fmt.Errorf("timeout waiting for backend readiness")
 }
 
-func bootstrapBackend(config *Config) error {
+func bootstrapBackend(config *Config, backendConfig *BackendConfig) error {
 	printStatus("Bootstrapping backend configuration...")
 
 	// Get machine IP
@@ -1648,12 +1714,22 @@ func bootstrapBackend(config *Config) error {
 		return fmt.Errorf("failed to read kubeconfig: %v", err)
 	}
 
+	// Prepare epinio URL and token
+	domain := config.DomainName
+	if domain == "" {
+		domain = fmt.Sprintf("%s.nip.io", ip)
+	}
+	epinioURL := fmt.Sprintf("https://epinio.%s", domain)
+	epinioToken := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", backendConfig.EpinioUsername, backendConfig.EpinioPassword)))
+
 	// Prepare request payload
 	payload := map[string]interface{}{
-		"email":      config.AdminEmail,
-		"password":   config.AdminPassword,
-		"ip":         ip,
-		"kubeconfig": string(kubeconfig),
+		"email":        config.AdminEmail,
+		"password":     config.AdminPassword,
+		"ip":           ip,
+		"kubeconfig":   string(kubeconfig),
+		"epinio_url":   epinioURL,
+		"epinio_token": epinioToken,
 	}
 
 	// Convert payload to JSON
@@ -1663,10 +1739,6 @@ func bootstrapBackend(config *Config) error {
 	}
 
 	// Make the API call
-	domain := config.DomainName
-	if domain == "" {
-		domain = fmt.Sprintf("%s.nip.io", ip)
-	}
 	url := fmt.Sprintf("https://api.%s/api/auth/bootstrap/", domain)
 
 	// Create custom HTTP client that skips SSL verification
@@ -1759,7 +1831,7 @@ deployments:
     containers:
     - envConfigmaps:
       - envs
-    - name: console
+      name: console
       ports:
       - containerPort: 3000
         name: app
@@ -1770,20 +1842,14 @@ deployments:
         requests:
           cpu: 5m
           memory: 128M
-      readinessProbe:
-        httpGet:
-          path: /
-          port: 3000
-        initialDelaySeconds: 180
-        periodSeconds: 10
     podLabels:
       app: shapeblock
       release: frontend
     replicas: 1
 
 envs:
-  NEXT_PUBLIC_API_URL: https://api.%s
-  NEXT_PUBLIC_WEBSOCKET_URL: wss://api.%s
+  NEXT_PUBLIC_API_URL: https://api.%s/api
+  NEXT_PUBLIC_WS_URL: wss://api.%s
   NEXT_PUBLIC_SAAS_NAME: "ShapeBlock FCL"
 
 generic:
@@ -1840,8 +1906,29 @@ ingresses:
 		return fmt.Errorf("failed to install frontend: %v", err)
 	}
 
-	printStatus("Frontend installed successfully")
-	return nil
+	// Wait for 120 seconds before checking readiness
+	printStatus("Waiting 120 seconds before checking frontend readiness...")
+	time.Sleep(120 * time.Second)
+
+	readinessURL := fmt.Sprintf("https://console.%s/login", domain)
+	printStatus(fmt.Sprintf("Checking frontend readiness at %s...", readinessURL))
+
+	maxRetries := 30 // 5 minutes total (10 second intervals)
+	for i := 0; i < maxRetries; i++ {
+		cmd := exec.Command("curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", readinessURL)
+		output, err := cmd.Output()
+		if err == nil && string(output) == "200" {
+			printStatus("Frontend is ready")
+			return nil
+		}
+
+		time.Sleep(10 * time.Second)
+		if i < maxRetries-1 { // Don't print "still waiting" on last iteration
+			printStatus(fmt.Sprintf("Still waiting for frontend readiness (attempt %d/%d)...", i+1, maxRetries))
+		}
+	}
+
+	return fmt.Errorf("timeout waiting for frontend readiness")
 }
 
 func updateFrontend(imageTag string) error {
