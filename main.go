@@ -936,7 +936,52 @@ func install(config *Config, backendConfig *BackendConfig) error {
 	printStatus("Checking if Kubernetes is already installed...")
 	if !resourceExists("node", "", "") {
 		printStatus("Kubernetes not found. Installing Kubernetes using k3sup...")
-		if err := runCommand("k3sup", "install", "--local", "--k3s-extra-args", "'--disable traefik'"); err != nil {
+
+		// Generate SSH keys
+		_, publicKey, err := generateSSHKeys()
+		if err != nil {
+			return fmt.Errorf("failed to generate SSH keys: %v", err)
+		}
+
+		// Add public key to authorized_keys
+		sshDir := filepath.Join(os.Getenv("HOME"), ".ssh")
+		if err := os.MkdirAll(sshDir, 0700); err != nil {
+			return fmt.Errorf("failed to create .ssh directory: %v", err)
+		}
+
+		authorizedKeysPath := filepath.Join(sshDir, "authorized_keys")
+		f, err := os.OpenFile(authorizedKeysPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		if err != nil {
+			return fmt.Errorf("failed to open authorized_keys: %v", err)
+		}
+		if _, err := f.WriteString(publicKey + "\n"); err != nil {
+			f.Close()
+			return fmt.Errorf("failed to write public key: %v", err)
+		}
+		f.Close()
+
+		// Get current user and IP
+		currentUser := os.Getenv("USER")
+		if currentUser == "" {
+			currentUser = "root"
+		}
+
+		ip, err := getNodeIP()
+		if err != nil {
+			return fmt.Errorf("failed to get node IP: %v", err)
+		}
+
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("failed to get home directory: %v", err)
+		}
+
+		// Install k3s using k3sup with SSH
+		if err := runCommand("k3sup", "install",
+			"--ip", ip,
+			"--user", currentUser,
+			"--ssh-key", filepath.Join(homeDir, "sb"),
+			"--k3s-extra-args", "'--disable traefik'"); err != nil {
 			return fmt.Errorf("failed to install Kubernetes: %v", err)
 		}
 
@@ -1723,13 +1768,30 @@ func bootstrapBackend(config *Config, backendConfig *BackendConfig) error {
 	epinioToken := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", backendConfig.EpinioUsername, backendConfig.EpinioPassword)))
 
 	// Prepare request payload
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("failed to get home directory: %v", err)
+	}
+
+	// Read existing SSH keys
+	privateKey, err := os.ReadFile(filepath.Join(homeDir, "sb"))
+	if err != nil {
+		return fmt.Errorf("failed to read private key: %v", err)
+	}
+	publicKey, err := os.ReadFile(filepath.Join(homeDir, "sb.pub"))
+	if err != nil {
+		return fmt.Errorf("failed to read public key: %v", err)
+	}
+
 	payload := map[string]interface{}{
-		"email":        config.AdminEmail,
-		"password":     config.AdminPassword,
-		"ip":           ip,
-		"kubeconfig":   string(kubeconfig),
-		"epinio_url":   epinioURL,
-		"epinio_token": epinioToken,
+		"email":           config.AdminEmail,
+		"password":        config.AdminPassword,
+		"ip":              ip,
+		"kubeconfig":      string(kubeconfig),
+		"epinio_url":      epinioURL,
+		"epinio_token":    epinioToken,
+		"ssh_private_key": string(privateKey),
+		"ssh_public_key":  string(publicKey),
 	}
 
 	// Convert payload to JSON
@@ -1752,50 +1814,6 @@ func bootstrapBackend(config *Config, backendConfig *BackendConfig) error {
 		return fmt.Errorf("bootstrap request failed: %v", err)
 	}
 	defer resp.Body.Close()
-
-	// Parse response
-	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("failed to decode response: %v", err)
-	}
-
-	publicKey, ok := result["public_key"].(string)
-	if !ok {
-		return fmt.Errorf("public key not found in response")
-	}
-
-	// Ensure .ssh directory exists
-	sshDir := filepath.Join(os.Getenv("HOME"), ".ssh")
-	if err := os.MkdirAll(sshDir, 0700); err != nil {
-		return fmt.Errorf("failed to create .ssh directory: %v", err)
-	}
-
-	// Check if authorized_keys exists and read last line
-	authorizedKeysPath := filepath.Join(sshDir, "authorized_keys")
-	var lastLine string
-	if content, err := os.ReadFile(authorizedKeysPath); err == nil && len(content) > 0 {
-		lines := strings.Split(strings.TrimSpace(string(content)), "\n")
-		if len(lines) > 0 {
-			lastLine = lines[len(lines)-1]
-		}
-	}
-
-	// Only append if the key is different from the last line
-	if lastLine != publicKey {
-		// Append public key to authorized_keys
-		f, err := os.OpenFile(authorizedKeysPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
-		if err != nil {
-			return fmt.Errorf("failed to open authorized_keys: %v", err)
-		}
-		defer f.Close()
-
-		if _, err := f.WriteString(publicKey + "\n"); err != nil {
-			return fmt.Errorf("failed to write public key: %v", err)
-		}
-		printStatus("Added new public key to authorized_keys")
-	} else {
-		printStatus("Public key already exists in authorized_keys")
-	}
 
 	printStatus("Backend bootstrapped successfully")
 	return nil
@@ -2171,4 +2189,48 @@ func uninstall() error {
 
 	printStatus("ShapeBlock has been successfully uninstalled")
 	return nil
+}
+
+func generateSSHKeys() (string, string, error) {
+	// Get home directory
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get home directory: %v", err)
+	}
+
+	// Define key paths
+	keyPath := filepath.Join(homeDir, "sb")
+	pubKeyPath := keyPath + ".pub"
+
+	// Check if keys already exist
+	if _, err := os.Stat(keyPath); err == nil {
+		// Keys exist, read and return them
+		privateKey, err := os.ReadFile(keyPath)
+		if err != nil {
+			return "", "", fmt.Errorf("failed to read private key: %v", err)
+		}
+		publicKey, err := os.ReadFile(pubKeyPath)
+		if err != nil {
+			return "", "", fmt.Errorf("failed to read public key: %v", err)
+		}
+		return string(privateKey), string(publicKey), nil
+	}
+
+	// Generate key pair
+	if err := runCommand("ssh-keygen", "-t", "rsa", "-b", "4096", "-f", keyPath, "-N", ""); err != nil {
+		return "", "", fmt.Errorf("failed to generate SSH keys: %v", err)
+	}
+
+	// Read generated keys
+	privateKey, err := os.ReadFile(keyPath)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to read private key: %v", err)
+	}
+
+	publicKey, err := os.ReadFile(pubKeyPath)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to read public key: %v", err)
+	}
+
+	return string(privateKey), string(publicKey), nil
 }
