@@ -20,9 +20,14 @@
 - write instructions to a file.
 - FE readiness probe
 - uninstall shapeblock
+- configure email
+- update check versions(sb backend, sb frontend images)
+- resend support for emails
 
 # TODO
 - pull buildpack
-- update check versions(sb backend, sb frontend images)
+- fetch logs from backend
+- reset admin password
+- add celery beat container for backend
 - udpate add cronjob on host
-- uninstall on multinode setup for host cluster
+- uninstall on multinode setup for host cluster(will get nodes on host, perform uninstall on each node, then print instructions to decommission worker nodes)

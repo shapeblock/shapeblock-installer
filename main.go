@@ -107,6 +107,14 @@ type BackendConfig struct {
 	LicenseKey          string
 }
 
+// Create email config struct
+type EmailConfig struct {
+	Host     string
+	Port     string
+	User     string
+	Password string
+}
+
 func printStatus(msg string) {
 	fmt.Printf("%s==>%s %s\n", colorGreen, colorNC, msg)
 	logMessage("INFO", msg)
@@ -1155,9 +1163,9 @@ func main() {
 	if len(os.Args) < 2 {
 		fmt.Println("Usage:")
 		fmt.Println("  shapeblock-installer install")
-		fmt.Println("  shapeblock-installer update --be-image <backend-image-tag>")
-		fmt.Println("  shapeblock-installer update --fe-image <frontend-image-tag>")
+		fmt.Println("  shapeblock-installer update [--be-image <backend-image-tag> | --fe-image <frontend-image-tag>]")
 		fmt.Println("  shapeblock-installer update-license")
+		fmt.Println("  shapeblock-installer configure-email")
 		fmt.Println("  shapeblock-installer uninstall")
 		os.Exit(1)
 	}
@@ -1193,6 +1201,43 @@ func main() {
 		logger.Printf("[%s] Installation completed successfully", time.Now().Format(logTimeFormat))
 
 	case "update":
+		if len(os.Args) == 2 { // No additional options provided
+			// Get latest available tag
+			latestTag, err := getLatestImageTag("backend")
+			if err != nil {
+				printError(fmt.Sprintf("Failed to get latest backend tag: %v", err))
+				os.Exit(1)
+			}
+
+			// Get current image tag using kubectl
+			cmd := exec.Command("kubectl", "get", "deployment", "-n", "shapeblock",
+				"production-shapeblock-backend", "-o",
+				"jsonpath={.spec.template.spec.containers[0].image}", "--kubeconfig=/etc/rancher/k3s/k3s.yaml")
+			output, err := cmd.Output()
+			if err != nil {
+				printError(fmt.Sprintf("Failed to get current backend image: %v", err))
+				os.Exit(1)
+			}
+
+			currentImage := string(output)
+			currentTag := strings.Split(currentImage, ":")[1]
+
+			if currentTag != latestTag {
+				printStatus(fmt.Sprintf("Updating backend from %s to %s", currentTag, latestTag))
+				if err := updateBackend(latestTag, ""); err != nil {
+					printError(fmt.Sprintf("Failed to update backend: %v", err))
+					logger.Printf("[%s] Update failed: %v", time.Now().Format(logTimeFormat), err)
+					os.Exit(1)
+				}
+				logger.Printf("[%s] Backend updated from %s to %s successfully",
+					time.Now().Format(logTimeFormat), currentTag, latestTag)
+			} else {
+				printStatus("Backend is already at the latest version")
+			}
+			return
+		}
+
+		// Existing option handling
 		if len(os.Args) != 4 {
 			fmt.Println("Usage: shapeblock-installer update [--be-image <backend-image-tag> | --fe-image <frontend-image-tag>]")
 			os.Exit(1)
@@ -1258,6 +1303,101 @@ func main() {
 			os.Exit(1)
 		}
 		logger.Printf("[%s] License update completed successfully", time.Now().Format(logTimeFormat))
+
+	case "configure-email":
+		// First, prompt for email service selection
+		prompt := promptui.Select{
+			Label: "Select Email Service",
+			Items: []string{"Gmail", "Resend"},
+		}
+
+		_, result, err := prompt.Run()
+		if err != nil {
+			printError(fmt.Sprintf("Failed to select email service: %v", err))
+			os.Exit(1)
+		}
+
+		if result == "Resend" {
+			// Prompt for Resend API key
+			prompt := promptui.Prompt{
+				Label:    "Resend API Key",
+				Mask:     '*',
+				Validate: validateRequired,
+			}
+			apiKey, err := prompt.Run()
+			if err != nil {
+				printError(fmt.Sprintf("Failed to collect Resend API key: %v", err))
+				os.Exit(1)
+			}
+
+			if err := updateBackendResend(apiKey); err != nil {
+				printError(fmt.Sprintf("Failed to update Resend configuration: %v", err))
+				logger.Printf("[%s] Resend configuration update failed: %v", time.Now().Format(logTimeFormat), err)
+				os.Exit(1)
+			}
+			logger.Printf("[%s] Resend configuration updated successfully", time.Now().Format(logTimeFormat))
+		} else {
+			// Existing Gmail flow
+			emailConfig := EmailConfig{
+				Host: "smtp.gmail.com",
+				Port: "587",
+			}
+
+			// Collect email configuration
+			prompt := promptui.Prompt{
+				Label:    "Email Host",
+				Default:  emailConfig.Host,
+				Validate: validateRequired,
+			}
+			result, err := prompt.Run()
+			if err != nil {
+				printError(fmt.Sprintf("Failed to collect email host: %v", err))
+				os.Exit(1)
+			}
+			emailConfig.Host = result
+
+			prompt = promptui.Prompt{
+				Label:    "Email Port",
+				Default:  emailConfig.Port,
+				Validate: validateRequired,
+			}
+			result, err = prompt.Run()
+			if err != nil {
+				printError(fmt.Sprintf("Failed to collect email port: %v", err))
+				os.Exit(1)
+			}
+			emailConfig.Port = result
+
+			prompt = promptui.Prompt{
+				Label:    "Email Host User",
+				Validate: validateEmail,
+			}
+			result, err = prompt.Run()
+			if err != nil {
+				printError(fmt.Sprintf("Failed to collect email user: %v", err))
+				os.Exit(1)
+			}
+			emailConfig.User = result
+
+			prompt = promptui.Prompt{
+				Label:    "Email Password",
+				Mask:     '*',
+				Validate: validateRequired,
+			}
+			result, err = prompt.Run()
+			if err != nil {
+				printError(fmt.Sprintf("Failed to collect email password: %v", err))
+				os.Exit(1)
+			}
+			emailConfig.Password = result
+
+			if err := updateEmailConfig(&emailConfig); err != nil {
+				printError(fmt.Sprintf("Failed to update email configuration: %v", err))
+				logger.Printf("[%s] Email configuration update failed: %v", time.Now().Format(logTimeFormat), err)
+				os.Exit(1)
+			}
+			logger.Printf("[%s] Email configuration updated successfully", time.Now().Format(logTimeFormat))
+		}
 
 	case "uninstall":
 		if err := uninstall(); err != nil {
@@ -1633,6 +1773,9 @@ ingresses:
 func updateBackend(imageTag, licenseKey string) error {
 	printStatus("Updating backend configuration...")
 
+	// Create timestamp for consistent rollout
+	timestamp := fmt.Sprintf("%d", time.Now().Unix())
+
 	// Create minimal values for update
 	minimalValues := "defaultImageTag: " + imageTag + "\n"
 	if licenseKey != "" {
@@ -1642,7 +1785,15 @@ envs:
 
 secretEnvs:
   LICENSE_KEY: "%s"
-`, licenseKey)
+
+deployments:
+  shapeblock-backend:
+    podLabels:
+      rolltime: "%s"
+  worker:
+    podLabels:
+      rolltime: "%s"
+`, licenseKey, timestamp, timestamp)
 	}
 
 	// Write minimal values to temporary file
@@ -2309,4 +2460,100 @@ func getLatestImageTag(image string) (string, error) {
 	}
 
 	return "", fmt.Errorf("no version tag found in latest version")
+}
+
+func updateEmailConfig(emailConfig *EmailConfig) error {
+	printStatus("Updating email configuration...")
+
+	// Create timestamp for consistent rollout
+	timestamp := fmt.Sprintf("%d", time.Now().Unix())
+
+	// Create values for email configuration update
+	values := fmt.Sprintf(`
+envs:
+  EMAIL_HOST: "%s"
+  EMAIL_PORT: "%s"
+  EMAIL_HOST_USER: "%s"
+
+secretEnvs:
+  EMAIL_HOST_PASSWORD: "%s"
+
+deployments:
+  shapeblock-backend:
+    podLabels:
+      rolltime: "%s"
+  worker:
+    podLabels:
+      rolltime: "%s"
+`, emailConfig.Host, emailConfig.Port, emailConfig.User, emailConfig.Password, timestamp, timestamp)
+
+	// Write values to temporary file
+	tmpfile, err := os.CreateTemp("", "email-config-*.yaml")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	if _, err := tmpfile.WriteString(values); err != nil {
+		return fmt.Errorf("failed to write values: %v", err)
+	}
+	tmpfile.Close()
+
+	// Update using helm with --reuse-values to preserve existing configuration
+	if err := runCommand("helm", "upgrade",
+		"backend", "nixys/universal-chart",
+		"--namespace", "shapeblock",
+		"--reuse-values",
+		"--values", tmpfile.Name(),
+		"--timeout", "600s"); err != nil {
+		return fmt.Errorf("failed to update email configuration: %v", err)
+	}
+
+	printStatus("Email configuration updated successfully")
+	return nil
+}
+
+func updateBackendResend(apiKey string) error {
+	printStatus("Updating Resend configuration...")
+
+	// Create timestamp for consistent rollout
+	timestamp := fmt.Sprintf("%d", time.Now().Unix())
+
+	// Create values for Resend configuration update
+	values := fmt.Sprintf(`
+secretEnvs:
+  RESEND_API_KEY: "%s"
+deployments:
+  shapeblock-backend:
+    podLabels:
+      rolltime: "%s"
+  worker:
+    podLabels:
+      rolltime: "%s"
+`, apiKey, timestamp, timestamp)
+
+	// Write values to temporary file
+	tmpfile, err := os.CreateTemp("", "resend-config-*.yaml")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	if _, err := tmpfile.WriteString(values); err != nil {
+		return fmt.Errorf("failed to write values: %v", err)
+	}
+	tmpfile.Close()
+
+	// Update using helm with --reuse-values to preserve existing configuration
+	if err := runCommand("helm", "upgrade",
+		"backend", "nixys/universal-chart",
+		"--namespace", "shapeblock",
+		"--reuse-values",
+		"--values", tmpfile.Name(),
+		"--timeout", "600s"); err != nil {
+		return fmt.Errorf("failed to update Resend configuration: %v", err)
+	}
+
+	printStatus("Resend configuration updated successfully")
+	return nil
 }
