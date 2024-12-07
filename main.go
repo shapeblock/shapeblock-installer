@@ -1407,6 +1407,34 @@ func main() {
 		}
 		logger.Printf("[%s] Uninstallation completed successfully", time.Now().Format(logTimeFormat))
 
+	case "reset-admin-password":
+		// Prompt for new admin password
+		prompt := promptui.Prompt{
+			Label:    "New Admin Password",
+			Mask:     '*',
+			Validate: validateRequired,
+		}
+		password, err := prompt.Run()
+		if err != nil {
+			printError(fmt.Sprintf("Failed to collect password: %v", err))
+			os.Exit(1)
+		}
+
+		if err := resetAdminPassword(password); err != nil {
+			printError(fmt.Sprintf("Failed to reset admin password: %v", err))
+			logger.Printf("[%s] Admin password reset failed: %v", time.Now().Format(logTimeFormat), err)
+			os.Exit(1)
+		}
+		logger.Printf("[%s] Admin password reset completed successfully", time.Now().Format(logTimeFormat))
+
+	case "dump-logs":
+		if err := dumpLogs(); err != nil {
+			printError(err.Error())
+			logger.Printf("[%s] Failed to dump logs: %v", time.Now().Format(logTimeFormat), err)
+			os.Exit(1)
+		}
+		logger.Printf("[%s] Logs dumped successfully", time.Now().Format(logTimeFormat))
+
 	default:
 		fmt.Printf("unknown subcommand: %s\n", os.Args[1])
 		fmt.Println("Usage:")
@@ -1415,6 +1443,8 @@ func main() {
 		fmt.Println("  shapeblock-installer update --fe-image <frontend-image-tag>")
 		fmt.Println("  shapeblock-installer update-license")
 		fmt.Println("  shapeblock-installer uninstall")
+		fmt.Println("  shapeblock-installer reset-admin-password")
+		fmt.Println("  shapeblock-installer dump-logs")
 		logger.Printf("[%s] Unknown subcommand: %s", time.Now().Format(logTimeFormat), os.Args[1])
 		os.Exit(1)
 	}
@@ -2555,5 +2585,73 @@ deployments:
 	}
 
 	printStatus("Resend configuration updated successfully")
+	return nil
+}
+
+func resetAdminPassword(password string) error {
+	printStatus("Resetting admin password...")
+
+	// Get the backend pod name
+	cmd := exec.Command("kubectl", "get", "pod", "-n", "shapeblock",
+		"-l", "app=shapeblock,release=backend",
+		"-o", "jsonpath={.items[0].metadata.name}", "--kubeconfig=/etc/rancher/k3s/k3s.yaml")
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to get backend pod: %v", err)
+	}
+	podName := string(output)
+
+	// Escape special characters in password by wrapping it in single quotes
+	// and escaping any existing single quotes in the password
+	escapedPassword := strings.Replace(password, "'", "'\"'\"'", -1)
+	resetCommand := fmt.Sprintf("python manage.py reset_admin_password '%s'", escapedPassword)
+
+	// Execute the Django management command in the pod using sh -c
+	if err := runCommand("kubectl", "exec", "-n", "shapeblock",
+		podName, "--",
+		"sh", "-c", resetCommand,
+		"--kubeconfig=/etc/rancher/k3s/k3s.yaml"); err != nil {
+		return fmt.Errorf("failed to reset admin password: %v", err)
+	}
+
+	printStatus("Admin password reset successfully")
+	return nil
+}
+
+func dumpLogs() error {
+	printStatus("Dumping backend logs...")
+
+	// Get the backend pod name
+	cmd := exec.Command("kubectl", "get", "pod", "-n", "shapeblock",
+		"-l", "app=shapeblock,release=backend",
+		"-o", "jsonpath={.items[0].metadata.name}", "--kubeconfig=/etc/rancher/k3s/k3s.yaml")
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to get backend pod: %v", err)
+	}
+	podName := string(output)
+
+	// Create logs directory if it doesn't exist
+	if err := os.MkdirAll("logs", 0755); err != nil {
+		return fmt.Errorf("failed to create logs directory: %v", err)
+	}
+
+	// Create log file with timestamp
+	timestamp := time.Now().Format("2006-01-02-15-04-05")
+	logFile := fmt.Sprintf("logs/backend-%s.log", timestamp)
+
+	// Get logs and write to file
+	cmd = exec.Command("kubectl", "logs", "-n", "shapeblock",
+		podName, "--kubeconfig=/etc/rancher/k3s/k3s.yaml")
+	logs, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to get logs: %v", err)
+	}
+
+	if err := os.WriteFile(logFile, logs, 0644); err != nil {
+		return fmt.Errorf("failed to write logs to file: %v", err)
+	}
+
+	printStatus(fmt.Sprintf("Logs have been written to %s", logFile))
 	return nil
 }

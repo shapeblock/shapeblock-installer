@@ -23,11 +23,13 @@
 - configure email
 - update check versions(sb backend, sb frontend images)
 - resend support for emails
+- fetch logs from backend
+- reset admin password
 
 # TODO
 - pull buildpack
-- fetch logs from backend
-- reset admin password
 - add celery beat container for backend
 - udpate add cronjob on host
+- toggle signup
+- install will pull latest images
 - uninstall on multinode setup for host cluster(will get nodes on host, perform uninstall on each node, then print instructions to decommission worker nodes)
