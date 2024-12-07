@@ -5,7 +5,7 @@ metadata:
 spec:
   description: Run k3sup to install k3s on nodes
   params:
-  - default: docker.io/shapeblock/k3sup:2024-12-01
+  - default: docker.io/shapeblock/k3sup:2024-12-06
     description: the k3sup image to use
     name: image
     type: string
@@ -72,9 +72,9 @@ spec:
     script: |
       #!/usr/bin/env bash
       if [ "$(params.cloud)" == "aws" ]; then
-        install-k3s.sh devices.json ubuntu
+        install-k3s.sh devices.json ubuntu $(params.op)
       else
-        install-k3s.sh devices.json root
+        install-k3s.sh devices.json root $(params.op)
       fi
       if [ "$(params.op)" == "create" ] ; then
         curl -H 'Content-Type: application/yaml' -H 'X-SB-Signature: $(params.clusterHeader)' --data-binary "@kubeconfig" $(params.sbUrl)/clusters/kubeconfig/
@@ -86,33 +86,6 @@ spec:
         curl -X POST -H 'Content-Type: application/json' -H 'X-SB-Signature: $(params.clusterHeader)' $(params.sbUrl)/clusters/status/
       fi
     workingDir: $(workspaces.source.path)
-
-  - name: pull-buildpacks
-    image: docker.io/cytopia/ansible:2.13-tools
-    script: |
-      #!/usr/bin/env bash
-
-      # Create ansible playbook
-      cat << 'EOF' > pull-buildpacks.yml
-      ---
-      - hosts: all
-        become: true
-        tasks:
-          - name: Pull buildpacks image
-            shell: k3s ctr images pull docker.io/paketobuildpacks/builder-jammy-full:0.3.398
-            register: pull_result
-            retries: 3
-            delay: 5
-            until: pull_result.rc == 0
-      EOF
-
-      # Run ansible playbook using the existing inventory
-      ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook \
-        -i inventory \
-        --private-key private-key \
-        pull-buildpacks.yml
-    workingDir: $(workspaces.source.path)
-    onError: continue
 
   workspaces:
   - name: source

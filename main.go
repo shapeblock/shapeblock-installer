@@ -1455,6 +1455,14 @@ func generateBackendValues(config *Config, backendConfig *BackendConfig) (string
 	if err != nil {
 		return "", err
 	}
+
+	// Get latest backend tag
+	latestTag, err := getLatestImageTag("backend")
+	if err != nil {
+		printStatus(fmt.Sprintf("Warning: Failed to get latest backend tag: %v. Using default tag.", err))
+		latestTag = "latest" // fallback tag
+	}
+
 	// Get domain or use IP if not set
 	domain := config.DomainName
 	if domain == "" {
@@ -1464,11 +1472,12 @@ func generateBackendValues(config *Config, backendConfig *BackendConfig) (string
 	// Log the values being used for debugging
 	logMessage("INFO", fmt.Sprintf("Using PostgreSQL credentials - Username: %s, Database: %s",
 		backendConfig.PostgresUsername, backendConfig.PostgresDatabase))
+	logMessage("INFO", fmt.Sprintf("Using backend image tag: %s", latestTag))
 
 	// Create the values template
 	valuesTemplate := `
 defaultImage: ghcr.io/shapeblock/backend
-defaultImageTag: v1.0.6-dec-03.11
+defaultImageTag: %s
 defaultImagePullPolicy: Always
 
 deployments:
@@ -1541,7 +1550,7 @@ envs:
   REDIS_HOST: "redis-master"
   ADMIN_URL: "admin-sb-4891/"
   SB_TLD: "%s"
-	SB_URL: "https://api.%s"
+  SB_URL: "https://api.%s"
   ALLOWED_HOSTS: api.%s
   KUBE_SERVER: https://%s:6443
   KUBE_NAMESPACE: shapeblock
@@ -1593,8 +1602,9 @@ ingresses:
     ingressClassName: nginx
     name: backend
 `
-	// Format the template with the required values
+	// Format the template with the required values, starting with the latestTag
 	values := fmt.Sprintf(valuesTemplate,
+		latestTag,
 		backendConfig.PostgresUsername,
 		backendConfig.PostgresPassword,
 		backendConfig.PostgresDatabase,
@@ -1838,10 +1848,17 @@ func installFrontend(config *Config) error {
 		domain = fmt.Sprintf("%s.nip.io", ip)
 	}
 
+	// Get latest frontend tag
+	latestTag, err := getLatestImageTag("frontend")
+	if err != nil {
+		printStatus(fmt.Sprintf("Warning: Failed to get latest frontend tag: %v. Using default tag.", err))
+		latestTag = "latest" // fallback tag
+	}
+
 	// Create values.yaml content
 	values := fmt.Sprintf(`
 defaultImage: ghcr.io/shapeblock/frontend
-defaultImageTag: v1.0.6-dec-03.2
+defaultImageTag: %s
 defaultImagePullPolicy: Always
 
 deployments:
@@ -1901,7 +1918,10 @@ ingresses:
         servicePort: 3000
     ingressClassName: nginx
     name: frontend
-`, domain, domain, domain)
+`, latestTag, domain, domain, domain)
+
+	// Log the values being used
+	logMessage("INFO", fmt.Sprintf("Using frontend image tag: %s", latestTag))
 
 	// Write values to temporary file
 	tmpfile, err := os.CreateTemp("", "frontend-values-*.yaml")
@@ -2233,4 +2253,60 @@ func generateSSHKeys() (string, string, error) {
 	}
 
 	return string(privateKey), string(publicKey), nil
+}
+
+func getLatestImageTag(image string) (string, error) {
+	// GitHub API URL for package versions
+	url := fmt.Sprintf("https://api.github.com/orgs/shapeblock/packages/container/%s/versions", image)
+
+	// Create the request
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %v", err)
+	}
+
+	// Add required headers
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Authorization", "Bearer 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")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	// Make the request
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to get versions: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("failed to get versions, status: %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	// Parse the response
+	var versions []struct {
+		Metadata struct {
+			Container struct {
+				Tags []string `json:"tags"`
+			} `json:"container"`
+		} `json:"metadata"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&versions); err != nil {
+		return "", fmt.Errorf("failed to decode response: %v", err)
+	}
+
+	// Get tags from the first version
+	if len(versions) == 0 {
+		return "", fmt.Errorf("no versions found")
+	}
+
+	// Look for tag starting with 'v' in the first version's tags
+	for _, tag := range versions[0].Metadata.Container.Tags {
+		if strings.HasPrefix(tag, "v") {
+			return tag, nil
+		}
+	}
+
+	return "", fmt.Errorf("no version tag found in latest version")
 }
