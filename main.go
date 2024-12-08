@@ -172,8 +172,13 @@ func runCommand(command string, args ...string) error {
 		args = append(args, "--kubeconfig=/etc/rancher/k3s/k3s.yaml")
 	}
 
-	// Print the command first
-	fmt.Printf("==> Running: %s %s\n", command, strings.Join(args, " "))
+	// For reset_admin_password command, print a generic message
+	if strings.Contains(command, "reset_admin_password") || strings.Contains(strings.Join(args, " "), "reset_admin_password") {
+		fmt.Println("==> Running: Resetting admin password...")
+	} else {
+		// Print the command first
+		fmt.Printf("==> Running: %s %s\n", command, strings.Join(args, " "))
+	}
 
 	// Start spinner without the command text
 	spinner := NewSpinner("Processing...")
@@ -645,7 +650,7 @@ func getNodeIP() (string, error) {
 }
 
 func generatePassword() string {
-	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*"
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	length := 16
 	b := make([]byte, length)
 	for i := range b {
@@ -1166,6 +1171,8 @@ func main() {
 		fmt.Println("  shapeblock-installer update [--be-image <backend-image-tag> | --fe-image <frontend-image-tag>]")
 		fmt.Println("  shapeblock-installer update-license")
 		fmt.Println("  shapeblock-installer configure-email")
+		fmt.Println("  shapeblock-installer dump-logs")
+		fmt.Println("  shapeblock-installer reset-admin-password")
 		fmt.Println("  shapeblock-installer uninstall")
 		os.Exit(1)
 	}
@@ -1202,14 +1209,14 @@ func main() {
 
 	case "update":
 		if len(os.Args) == 2 { // No additional options provided
-			// Get latest available tag
-			latestTag, err := getLatestImageTag("backend")
+			// Get latest available backend tag
+			latestBackendTag, err := getLatestImageTag("backend")
 			if err != nil {
 				printError(fmt.Sprintf("Failed to get latest backend tag: %v", err))
 				os.Exit(1)
 			}
 
-			// Get current image tag using kubectl
+			// Get current backend image tag using kubectl
 			cmd := exec.Command("kubectl", "get", "deployment", "-n", "shapeblock",
 				"production-shapeblock-backend", "-o",
 				"jsonpath={.spec.template.spec.containers[0].image}", "--kubeconfig=/etc/rancher/k3s/k3s.yaml")
@@ -1219,20 +1226,55 @@ func main() {
 				os.Exit(1)
 			}
 
-			currentImage := string(output)
-			currentTag := strings.Split(currentImage, ":")[1]
+			currentBackendImage := string(output)
+			currentBackendTag := strings.Split(currentBackendImage, ":")[1]
 
-			if currentTag != latestTag {
-				printStatus(fmt.Sprintf("Updating backend from %s to %s", currentTag, latestTag))
-				if err := updateBackend(latestTag, ""); err != nil {
+			// Get latest available frontend tag
+			latestFrontendTag, err := getLatestImageTag("frontend")
+			if err != nil {
+				printError(fmt.Sprintf("Failed to get latest frontend tag: %v", err))
+				os.Exit(1)
+			}
+
+			// Get current frontend image tag using kubectl
+			cmd = exec.Command("kubectl", "get", "deployment", "-n", "shapeblock",
+				"frontend-console", "-o",
+				"jsonpath={.spec.template.spec.containers[0].image}", "--kubeconfig=/etc/rancher/k3s/k3s.yaml")
+			output, err = cmd.Output()
+			if err != nil {
+				printError(fmt.Sprintf("Failed to get current frontend image: %v", err))
+				os.Exit(1)
+			}
+
+			currentFrontendImage := string(output)
+			currentFrontendTag := strings.Split(currentFrontendImage, ":")[1]
+
+			// Update backend if needed
+			if currentBackendTag != latestBackendTag {
+				printStatus(fmt.Sprintf("Updating backend from %s to %s", currentBackendTag, latestBackendTag))
+				if err := updateBackend(latestBackendTag, ""); err != nil {
 					printError(fmt.Sprintf("Failed to update backend: %v", err))
 					logger.Printf("[%s] Update failed: %v", time.Now().Format(logTimeFormat), err)
 					os.Exit(1)
 				}
 				logger.Printf("[%s] Backend updated from %s to %s successfully",
-					time.Now().Format(logTimeFormat), currentTag, latestTag)
+					time.Now().Format(logTimeFormat), currentBackendTag, latestBackendTag)
 			} else {
 				printStatus("Backend is already at the latest version")
+			}
+
+			// Update frontend if needed
+			if currentFrontendTag != latestFrontendTag {
+				printStatus(fmt.Sprintf("Updating frontend from %s to %s", currentFrontendTag, latestFrontendTag))
+				if err := updateFrontend(latestFrontendTag); err != nil {
+					printError(fmt.Sprintf("Failed to update frontend: %v", err))
+					logger.Printf("[%s] Update failed: %v", time.Now().Format(logTimeFormat), err)
+					os.Exit(1)
+				}
+				logger.Printf("[%s] Frontend updated from %s to %s successfully",
+					time.Now().Format(logTimeFormat), currentFrontendTag, latestFrontendTag)
+			} else {
+				printStatus("Frontend is already at the latest version")
 			}
 			return
 		}
@@ -1439,8 +1481,7 @@ func main() {
 		fmt.Printf("unknown subcommand: %s\n", os.Args[1])
 		fmt.Println("Usage:")
 		fmt.Println("  shapeblock-installer install")
-		fmt.Println("  shapeblock-installer update --be-image <backend-image-tag>")
-		fmt.Println("  shapeblock-installer update --fe-image <frontend-image-tag>")
+		fmt.Println("  shapeblock-installer update [--be-image <backend-image-tag> | --fe-image <frontend-image-tag>]")
 		fmt.Println("  shapeblock-installer update-license")
 		fmt.Println("  shapeblock-installer uninstall")
 		fmt.Println("  shapeblock-installer reset-admin-password")
@@ -2608,9 +2649,9 @@ func resetAdminPassword(password string) error {
 
 	// Execute the Django management command in the pod using sh -c
 	if err := runCommand("kubectl", "exec", "-n", "shapeblock",
+		"--kubeconfig=/etc/rancher/k3s/k3s.yaml",
 		podName, "--",
-		"sh", "-c", resetCommand,
-		"--kubeconfig=/etc/rancher/k3s/k3s.yaml"); err != nil {
+		"sh", "-c", resetCommand); err != nil {
 		return fmt.Errorf("failed to reset admin password: %v", err)
 	}
 
