@@ -1170,10 +1170,9 @@ func main() {
 		fmt.Println("  shapeblock-installer install")
 		fmt.Println("  shapeblock-installer update [--be-image <backend-image-tag> | --fe-image <frontend-image-tag>]")
 		fmt.Println("  shapeblock-installer update-license")
-		fmt.Println("  shapeblock-installer configure-email")
-		fmt.Println("  shapeblock-installer dump-logs")
-		fmt.Println("  shapeblock-installer reset-admin-password")
 		fmt.Println("  shapeblock-installer uninstall")
+		fmt.Println("  shapeblock-installer reset-admin-password")
+		fmt.Println("  shapeblock-installer dump-logs")
 		os.Exit(1)
 	}
 
@@ -1345,101 +1344,6 @@ func main() {
 			os.Exit(1)
 		}
 		logger.Printf("[%s] License update completed successfully", time.Now().Format(logTimeFormat))
-
-	case "configure-email":
-		// First, prompt for email service selection
-		prompt := promptui.Select{
-			Label: "Select Email Service",
-			Items: []string{"Gmail", "Resend"},
-		}
-
-		_, result, err := prompt.Run()
-		if err != nil {
-			printError(fmt.Sprintf("Failed to select email service: %v", err))
-			os.Exit(1)
-		}
-
-		if result == "Resend" {
-			// Prompt for Resend API key
-			prompt := promptui.Prompt{
-				Label:    "Resend API Key",
-				Mask:     '*',
-				Validate: validateRequired,
-			}
-			apiKey, err := prompt.Run()
-			if err != nil {
-				printError(fmt.Sprintf("Failed to collect Resend API key: %v", err))
-				os.Exit(1)
-			}
-
-			if err := updateBackendResend(apiKey); err != nil {
-				printError(fmt.Sprintf("Failed to update Resend configuration: %v", err))
-				logger.Printf("[%s] Resend configuration update failed: %v", time.Now().Format(logTimeFormat), err)
-				os.Exit(1)
-			}
-			logger.Printf("[%s] Resend configuration updated successfully", time.Now().Format(logTimeFormat))
-		} else {
-			// Existing Gmail flow
-			emailConfig := EmailConfig{
-				Host: "smtp.gmail.com",
-				Port: "587",
-			}
-
-			// Collect email configuration
-			prompt := promptui.Prompt{
-				Label:    "Email Host",
-				Default:  emailConfig.Host,
-				Validate: validateRequired,
-			}
-			result, err := prompt.Run()
-			if err != nil {
-				printError(fmt.Sprintf("Failed to collect email host: %v", err))
-				os.Exit(1)
-			}
-			emailConfig.Host = result
-
-			prompt = promptui.Prompt{
-				Label:    "Email Port",
-				Default:  emailConfig.Port,
-				Validate: validateRequired,
-			}
-			result, err = prompt.Run()
-			if err != nil {
-				printError(fmt.Sprintf("Failed to collect email port: %v", err))
-				os.Exit(1)
-			}
-			emailConfig.Port = result
-
-			prompt = promptui.Prompt{
-				Label:    "Email Host User",
-				Validate: validateEmail,
-			}
-			result, err = prompt.Run()
-			if err != nil {
-				printError(fmt.Sprintf("Failed to collect email user: %v", err))
-				os.Exit(1)
-			}
-			emailConfig.User = result
-
-			prompt = promptui.Prompt{
-				Label:    "Email Password",
-				Mask:     '*',
-				Validate: validateRequired,
-			}
-			result, err = prompt.Run()
-			if err != nil {
-				printError(fmt.Sprintf("Failed to collect email password: %v", err))
-				os.Exit(1)
-			}
-			emailConfig.Password = result
-
-			if err := updateEmailConfig(&emailConfig); err != nil {
-				printError(fmt.Sprintf("Failed to update email configuration: %v", err))
-				logger.Printf("[%s] Email configuration update failed: %v", time.Now().Format(logTimeFormat), err)
-				os.Exit(1)
-			}
-			logger.Printf("[%s] Email configuration updated successfully", time.Now().Format(logTimeFormat))
-		}
 
 	case "uninstall":
 		if err := uninstall(); err != nil {
@@ -2402,6 +2306,63 @@ func uninstall() error {
 
 	// Uninstall k3s
 	printStatus("Uninstalling k3s...")
+
+	// Get all k3s nodes with their internal IPs
+	cmd := exec.Command("kubectl", "get", "nodes", "-o", "jsonpath={range .items[*]}{.metadata.name},{.status.addresses[?(@.type==\"InternalIP\")].address},{.metadata.labels['node-role\\.kubernetes\\.io/master']}{\"\\n\"}{end}", "--kubeconfig=/etc/rancher/k3s/k3s.yaml")
+	output, err := cmd.Output()
+	if err != nil {
+		printStatus("No k3s nodes found or unable to get nodes")
+	} else {
+		// Get the SSH key path
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			printStatus(fmt.Sprintf("Warning: Failed to get home directory: %v", err))
+		} else {
+			sshKeyPath := filepath.Join(homeDir, "sb")
+			currentUser := os.Getenv("USER")
+			if currentUser == "" {
+				currentUser = "root"
+			}
+
+			// Keep track of worker nodes
+			var workerNodes []string
+
+			// Process each node
+			nodes := strings.Split(strings.TrimSpace(string(output)), "\n")
+			for _, node := range nodes {
+				parts := strings.Split(node, ",")
+				if len(parts) < 3 {
+					continue
+				}
+				nodeName := parts[0]
+				nodeIP := parts[1]
+				isMaster := parts[2] != ""
+
+				if !isMaster {
+					// This is a worker node
+					workerNodes = append(workerNodes, fmt.Sprintf("%s (%s)", nodeName, nodeIP))
+					printStatus(fmt.Sprintf("Uninstalling k3s from worker node %s (%s)...", nodeName, nodeIP))
+					if err := runCommand("ssh", "-i", sshKeyPath, "-o", "StrictHostKeyChecking=no", fmt.Sprintf("%s@%s", currentUser, nodeIP), "sudo /usr/local/bin/k3s-agent-uninstall.sh"); err != nil {
+						printStatus(fmt.Sprintf("Warning: Failed to uninstall k3s from worker node %s: %v", nodeName, err))
+					}
+				}
+			}
+
+			// Print decommissioning message if there were worker nodes
+			if len(workerNodes) > 0 {
+				message := "\nNOTE: k3s has been uninstalled from the following worker nodes:\n"
+				for _, node := range workerNodes {
+					message += fmt.Sprintf("  - %s\n", node)
+				}
+				message += "\nThese nodes need to be manually decommissioned. The following tasks may be required:\n"
+				message += "1. Update your infrastructure configuration to remove these nodes\n"
+				message += "2. If these are cloud instances, consider terminating them if no longer needed\n"
+				printStatus(message)
+			}
+		}
+	}
+
+	// Finally uninstall from master node
 	if _, err := os.Stat("/usr/local/bin/k3s-uninstall.sh"); os.IsNotExist(err) {
 		printStatus("Note: k3s is already uninstalled")
 	} else if err != nil {
