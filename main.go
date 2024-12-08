@@ -1705,8 +1705,8 @@ deployments:
           cpu: "500m"
           memory: "512Mi"
         requests:
-          cpu: 5m
-          memory: 128M
+          cpu: "5m"
+          memory: "128Mi"
 
     containers:
     - envConfigmaps:
@@ -1714,17 +1714,21 @@ deployments:
       envSecrets:
       - secret-envs
       name: shapeblock-backend
-      command: ['uvicorn', '--host', '0.0.0.0', '--port', '8000', '--workers', '1', 'shapeblock.asgi:application']
+      command: ['uvicorn', '--host', '0.0.0.0', '--port', '8000', '--workers', '2', 'shapeblock.asgi:application']
       ports:
       - containerPort: 8000
         name: app
       resources:
         limits:
-          cpu: "1"
-          memory: 2Gi
+          cpu: "500m"
+          memory: "512Mi"
         requests:
-          cpu: 5m
-          memory: 128M
+          cpu: "200m"
+          memory: "512Mi"
+      readinessProbe:
+        httpGet:
+          path: /ready/
+          port: 8000
 
     podLabels:
       app: shapeblock
@@ -1739,13 +1743,6 @@ deployments:
       - secret-envs
       name: worker
       command: ['celery', '-A', 'shapeblock', 'worker', '-l', 'INFO']
-      resources:
-        limits:
-          cpu: "1"
-          memory: 2Gi
-        requests:
-          cpu: 5m
-          memory: 128M
     podLabels:
       app: shapeblock
       release: backend
@@ -2092,13 +2089,17 @@ deployments:
       ports:
       - containerPort: 3000
         name: app
+      readinessProbe:
+        httpGet:
+          path: /login
+          port: 3000
       resources:
         limits:
           cpu: "1"
           memory: 2Gi
         requests:
-          cpu: 5m
-          memory: 128M
+          cpu: 200m
+          memory: 512M
     podLabels:
       app: shapeblock
       release: frontend
