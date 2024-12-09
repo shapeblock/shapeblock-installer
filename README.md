@@ -27,9 +27,9 @@
 - reset admin password
 - install will pull latest images
 - uninstall on multinode setup for host cluster(will get nodes on host, perform uninstall on each node, then print instructions to decommission worker nodes)
+- udpate add cronjob on host
 
 # TODO
 - pull buildpack
-- add celery beat container for backend
-- udpate add cronjob on host
+- add celery beat container for backend(later)
 - toggle signup

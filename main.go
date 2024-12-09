@@ -86,10 +86,11 @@ func logMessage(level, msg string) {
 }
 
 type Config struct {
-	LicenseKey    string
-	AdminEmail    string
-	AdminPassword string
-	DomainName    string
+	LicenseKey       string
+	AdminEmail       string
+	AdminPassword    string
+	DomainName       string
+	EnableAutoUpdate bool
 }
 
 type BackendConfig struct {
@@ -1077,6 +1078,22 @@ func install(config *Config, backendConfig *BackendConfig) error {
 		return fmt.Errorf("failed to print instructions: %v", err)
 	}
 
+	// Set up auto-updates if enabled
+	if config.EnableAutoUpdate {
+		exePath, err := os.Executable()
+		if err != nil {
+			logMessage("ERROR", fmt.Sprintf("Failed to get executable path: %v", err))
+		} else {
+			// Create a cron job for daily updates at midnight
+			cronCmd := fmt.Sprintf("0 0 * * * %s update", exePath)
+			if err := setupCronJob(cronCmd); err != nil {
+				logMessage("ERROR", fmt.Sprintf("Failed to setup auto-updates: %v", err))
+			} else {
+				printStatus("Automatic daily updates enabled. The system will check for updates at midnight every day.")
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -1151,6 +1168,16 @@ func collectInput(config *Config, backendConfig *BackendConfig) error {
 	}
 	config.DomainName = result
 
+	// Auto Update
+	prompt = promptui.Prompt{
+		Label:     "Enable automatic daily updates",
+		IsConfirm: true,
+	}
+	result, err = prompt.Run()
+	if err == nil && result == "y" {
+		config.EnableAutoUpdate = true
+	}
+
 	// Log collected information (excluding passwords)
 	logMessage("INFO", fmt.Sprintf("Admin email: %s", config.AdminEmail))
 	logMessage("INFO", fmt.Sprintf("Domain name: %s", config.DomainName))
@@ -1158,7 +1185,15 @@ func collectInput(config *Config, backendConfig *BackendConfig) error {
 	return nil
 }
 
-// Update main function to use interactive input
+func setupCronJob(cmd string) error {
+	// Write to crontab
+	cronTab := fmt.Sprintf("crontab -l; echo '%s'", cmd)
+	if err := runCommand("bash", "-c", cronTab); err != nil {
+		return fmt.Errorf("failed to setup cron job: %v", err)
+	}
+	return nil
+}
+
 func main() {
 	if err := initLogger(); err != nil {
 		fmt.Printf("%sError:%s Failed to initialize logger: %v\n", colorRed, colorNC, err)
@@ -2212,6 +2247,7 @@ func uninstall() error {
 	if err != nil {
 		return fmt.Errorf("failed to create request: %v", err)
 	}
+
 	req.Header.Set("Accept", "application/vnd.api+json")
 	req.Header.Set("Authorization", "License "+licenseKey)
 
@@ -2248,6 +2284,7 @@ func uninstall() error {
 	if err != nil {
 		return fmt.Errorf("failed to create delete request: %v", err)
 	}
+
 	req.Header.Set("Accept", "application/vnd.api+json")
 	req.Header.Set("Authorization", "License "+licenseKey)
 
