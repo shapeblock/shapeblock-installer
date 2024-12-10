@@ -86,11 +86,12 @@ func logMessage(level, msg string) {
 }
 
 type Config struct {
-	LicenseKey       string
-	AdminEmail       string
-	AdminPassword    string
-	DomainName       string
-	EnableAutoUpdate bool
+	LicenseKey         string
+	AdminEmail         string
+	AdminPassword      string
+	DomainName         string
+	EnableAutoUpdate   bool
+	AllowRegistrations bool
 }
 
 type BackendConfig struct {
@@ -1178,6 +1179,16 @@ func collectInput(config *Config, backendConfig *BackendConfig) error {
 		config.EnableAutoUpdate = true
 	}
 
+	// Allow New Registrations
+	prompt = promptui.Prompt{
+		Label:     "Allow new user registrations (admin can still invite users)",
+		IsConfirm: true,
+	}
+	result, err = prompt.Run()
+	if err == nil && result == "y" {
+		config.AllowRegistrations = true
+	}
+
 	// Log collected information (excluding passwords)
 	logMessage("INFO", fmt.Sprintf("Admin email: %s", config.AdminEmail))
 	logMessage("INFO", fmt.Sprintf("Domain name: %s", config.DomainName))
@@ -1205,6 +1216,7 @@ func main() {
 		fmt.Println("  shapeblock-installer install")
 		fmt.Println("  shapeblock-installer update [--be-image <backend-image-tag> | --fe-image <frontend-image-tag>]")
 		fmt.Println("  shapeblock-installer update-license")
+		fmt.Println("  shapeblock-installer configure-registration")
 		fmt.Println("  shapeblock-installer uninstall")
 		fmt.Println("  shapeblock-installer reset-admin-password")
 		fmt.Println("  shapeblock-installer dump-logs")
@@ -1380,6 +1392,14 @@ func main() {
 		}
 		logger.Printf("[%s] License update completed successfully", time.Now().Format(logTimeFormat))
 
+	case "configure-registration":
+		if err := updateRegistrationSettings(); err != nil {
+			printError(fmt.Sprintf("Failed to update registration settings: %v", err))
+			logger.Printf("[%s] Registration settings update failed: %v", time.Now().Format(logTimeFormat), err)
+			os.Exit(1)
+		}
+		logger.Printf("[%s] Registration settings updated successfully", time.Now().Format(logTimeFormat))
+
 	case "uninstall":
 		if err := uninstall(); err != nil {
 			printError(fmt.Sprintf("Uninstallation failed: %v", err))
@@ -1422,6 +1442,7 @@ func main() {
 		fmt.Println("  shapeblock-installer install")
 		fmt.Println("  shapeblock-installer update [--be-image <backend-image-tag> | --fe-image <frontend-image-tag>]")
 		fmt.Println("  shapeblock-installer update-license")
+		fmt.Println("  shapeblock-installer allow-registration")
 		fmt.Println("  shapeblock-installer uninstall")
 		fmt.Println("  shapeblock-installer reset-admin-password")
 		fmt.Println("  shapeblock-installer dump-logs")
@@ -1708,6 +1729,7 @@ envs:
   CUSTOM_PASSWORD_RESET_DOMAIN: "https://console.%s"
   INVITATIONS_SIGNUP_REDIRECT: "https://console.%s/register"
   DEPLOYMENT_MODE: "single-tenant"
+  ALLOW_NEW_REGISTRATIONS: "%s"
 
 generic:
   labels:
@@ -1767,6 +1789,7 @@ ingresses:
 		domain,
 		domain,
 		domain,
+		map[bool]string{true: "True", false: "False"}[config.AllowRegistrations],
 		generateSecretKey(),
 		backendConfig.ServiceAccountToken,
 		generateFernetKeys(),
@@ -2625,6 +2648,59 @@ deployments:
 	}
 
 	printStatus("Resend configuration updated successfully")
+	return nil
+}
+
+func updateRegistrationSettings() error {
+	prompt := promptui.Prompt{
+		Label:     "Allow new user registrations (admin can still invite users)",
+		IsConfirm: true,
+	}
+	result, err := prompt.Run()
+	if err != nil {
+		return fmt.Errorf("prompt failed: %v", err)
+	}
+
+	allowRegistrations := err == nil && result == "y"
+	allowRegistrationsStr := map[bool]string{true: "True", false: "False"}[allowRegistrations]
+
+	// Create minimal values for update
+	minimalValues := fmt.Sprintf(`
+envs:
+  ALLOW_NEW_REGISTRATIONS: "%s"
+
+deployments:
+  shapeblock-backend:
+    podLabels:
+      rolltime: "%d"
+  worker:
+    podLabels:
+      rolltime: "%d"
+`, allowRegistrationsStr, time.Now().Unix(), time.Now().Unix())
+
+	// Write minimal values to temporary file
+	tmpfile, err := os.CreateTemp("", "backend-values-*.yaml")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	if _, err := tmpfile.WriteString(minimalValues); err != nil {
+		return fmt.Errorf("failed to write values: %v", err)
+	}
+	tmpfile.Close()
+
+	// Update using helm with --reuse-values to preserve existing configuration
+	if err := runCommand("helm", "upgrade",
+		"production-backend", "nixys/universal-chart",
+		"--namespace", "shapeblock",
+		"--reuse-values",
+		"--values", tmpfile.Name(),
+		"--timeout", "600s"); err != nil {
+		return fmt.Errorf("failed to update backend: %v", err)
+	}
+
+	printStatus(fmt.Sprintf("Registration settings updated successfully. New registrations are now %s", map[bool]string{true: "enabled", false: "disabled"}[allowRegistrations]))
 	return nil
 }
 
