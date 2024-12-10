@@ -14,9 +14,6 @@ go build -o ${BIN_DIR}/${CLI_NAME} main.go
 # For Linux (64-bit)
 GOOS=linux GOARCH=amd64 go build -o ${BIN_DIR}/${CLI_NAME}-linux-amd64 main.go
 
-# For macOS (64-bit)
-GOOS=darwin GOARCH=amd64 go build -o ${BIN_DIR}/${CLI_NAME}-darwin-amd64 main.go
-
 # Build with version information
 go build -ldflags="-X main.Version=${VERSION}" -o ${BIN_DIR}/${CLI_NAME} main.go
 
