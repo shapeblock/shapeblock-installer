@@ -1,7 +1,6 @@
 #!/bin/bash
 
 CLI_NAME="shapeblock-installer"
-VERSION="1.0.0"
 BIN_DIR="bin"
 
 # Create bin directory if it doesn't exist
@@ -12,6 +11,9 @@ if [ -z "${GH_TOKEN}" ]; then
     echo "Error: GH_TOKEN environment variable is not set"
     exit 1
 fi
+
+# Set version to "latest" by default, override with VERSION env var if set
+VERSION=${VERSION:-latest}
 
 # Basic build with version and GitHub token
 go build -ldflags="-X main.Version=${VERSION} -X main.githubToken=${GH_TOKEN}" -o ${BIN_DIR}/${CLI_NAME} main.go

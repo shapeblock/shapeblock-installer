@@ -23,6 +23,7 @@ jobs:
       run: make build
       env:
         GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        VERSION: ${{ github.ref_name }}
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v3
