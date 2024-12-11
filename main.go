@@ -53,6 +53,9 @@ var logger *log.Logger
 //go:embed assets/epinio/*
 var epinioAssets embed.FS
 
+// Add this near the top of the file with other constants
+var githubToken string // Will be set during compilation
+
 func initLogger() error {
 	timestamp := time.Now().Format(timeFormat)
 	logFile := fmt.Sprintf("install-%s.log", timestamp)
@@ -2599,7 +2602,7 @@ func getLatestImageTag(image string) (string, error) {
 
 	// Add required headers
 	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("Authorization", "Bearer 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")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", githubToken))
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 
 	// Make the request
