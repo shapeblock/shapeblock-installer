@@ -29,8 +29,8 @@
 - uninstall on multinode setup for host cluster(will get nodes on host, perform uninstall on each node, then print instructions to decommission worker nodes)
 - udpate add cronjob on host
 - toggle signup
+- choose between smtp and resend
+- pull buildpack
 
 # TODO
-- pull buildpack
 - add celery beat container for backend(later)
-- choose between smtp and resend

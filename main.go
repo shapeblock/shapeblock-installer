@@ -1075,6 +1075,10 @@ func install(config *Config, backendConfig *BackendConfig) error {
 		return fmt.Errorf("failed to install frontend: %v", err)
 	}
 
+	if err := pullBuildpackImage(); err != nil {
+		return fmt.Errorf("failed to pull buildpack image: %v", err)
+	}
+
 	if err := printInstructions(config); err != nil {
 		return fmt.Errorf("failed to print instructions: %v", err)
 	}
@@ -1205,6 +1209,80 @@ func setupCronJob(cmd string) error {
 	return nil
 }
 
+func configureEmail() error {
+	// First prompt user to choose between SMTP and Resend
+	prompt := promptui.Select{
+		Label: "Select email service",
+		Items: []string{"SMTP", "Resend"},
+	}
+
+	_, result, err := prompt.Run()
+	if err != nil {
+		return fmt.Errorf("prompt failed: %v", err)
+	}
+
+	if result == "SMTP" {
+		// Collect SMTP configuration
+		var emailConfig EmailConfig
+
+		// Host
+		hostPrompt := promptui.Prompt{
+			Label:    "SMTP Host",
+			Validate: validateRequired,
+		}
+		emailConfig.Host, err = hostPrompt.Run()
+		if err != nil {
+			return fmt.Errorf("prompt failed: %v", err)
+		}
+
+		// Port
+		portPrompt := promptui.Prompt{
+			Label:    "SMTP Port",
+			Validate: validateRequired,
+		}
+		emailConfig.Port, err = portPrompt.Run()
+		if err != nil {
+			return fmt.Errorf("prompt failed: %v", err)
+		}
+
+		// Username
+		userPrompt := promptui.Prompt{
+			Label:    "SMTP Username",
+			Validate: validateRequired,
+		}
+		emailConfig.User, err = userPrompt.Run()
+		if err != nil {
+			return fmt.Errorf("prompt failed: %v", err)
+		}
+
+		// Password
+		passwordPrompt := promptui.Prompt{
+			Label:    "SMTP Password",
+			Mask:     '*',
+			Validate: validateRequired,
+		}
+		emailConfig.Password, err = passwordPrompt.Run()
+		if err != nil {
+			return fmt.Errorf("prompt failed: %v", err)
+		}
+
+		return updateEmailConfig(&emailConfig)
+
+	} else {
+		// Collect Resend API key
+		apiKeyPrompt := promptui.Prompt{
+			Label:    "Resend API Key",
+			Validate: validateRequired,
+		}
+		apiKey, err := apiKeyPrompt.Run()
+		if err != nil {
+			return fmt.Errorf("prompt failed: %v", err)
+		}
+
+		return updateBackendResend(apiKey)
+	}
+}
+
 func main() {
 	if err := initLogger(); err != nil {
 		fmt.Printf("%sError:%s Failed to initialize logger: %v\n", colorRed, colorNC, err)
@@ -1217,6 +1295,7 @@ func main() {
 		fmt.Println("  shapeblock-installer update [--be-image <backend-image-tag> | --fe-image <frontend-image-tag>]")
 		fmt.Println("  shapeblock-installer update-license")
 		fmt.Println("  shapeblock-installer configure-registration")
+		fmt.Println("  shapeblock-installer configure-email")
 		fmt.Println("  shapeblock-installer uninstall")
 		fmt.Println("  shapeblock-installer reset-admin-password")
 		fmt.Println("  shapeblock-installer dump-logs")
@@ -1400,6 +1479,14 @@ func main() {
 		}
 		logger.Printf("[%s] Registration settings updated successfully", time.Now().Format(logTimeFormat))
 
+	case "configure-email":
+		if err := configureEmail(); err != nil {
+			printError(fmt.Sprintf("Failed to configure email: %v", err))
+			logger.Printf("[%s] Email configuration failed: %v", time.Now().Format(logTimeFormat), err)
+			os.Exit(1)
+		}
+		logger.Printf("[%s] Email configuration completed successfully", time.Now().Format(logTimeFormat))
+
 	case "uninstall":
 		if err := uninstall(); err != nil {
 			printError(fmt.Sprintf("Uninstallation failed: %v", err))
@@ -1442,7 +1529,8 @@ func main() {
 		fmt.Println("  shapeblock-installer install")
 		fmt.Println("  shapeblock-installer update [--be-image <backend-image-tag> | --fe-image <frontend-image-tag>]")
 		fmt.Println("  shapeblock-installer update-license")
-		fmt.Println("  shapeblock-installer allow-registration")
+		fmt.Println("  shapeblock-installer configure-registration")
+		fmt.Println("  shapeblock-installer configure-email")
 		fmt.Println("  shapeblock-installer uninstall")
 		fmt.Println("  shapeblock-installer reset-admin-password")
 		fmt.Println("  shapeblock-installer dump-logs")
@@ -2601,7 +2689,8 @@ deployments:
 		"--timeout", "600s"); err != nil {
 		return fmt.Errorf("failed to update email configuration: %v", err)
 	}
-
+	// unset resend api key
+	updateBackendResend("")
 	printStatus("Email configuration updated successfully")
 	return nil
 }
@@ -2692,7 +2781,7 @@ deployments:
 
 	// Update using helm with --reuse-values to preserve existing configuration
 	if err := runCommand("helm", "upgrade",
-		"production-backend", "nixys/universal-chart",
+		"backend", "nixys/universal-chart",
 		"--namespace", "shapeblock",
 		"--reuse-values",
 		"--values", tmpfile.Name(),
@@ -2769,5 +2858,14 @@ func dumpLogs() error {
 	}
 
 	printStatus(fmt.Sprintf("Logs have been written to %s", logFile))
+	return nil
+}
+
+func pullBuildpackImage() error {
+	printStatus("Pulling buildpack image...")
+	if err := runCommand("k3s", "ctr", "images", "pull", "docker.io/paketobuildpacks/builder-jammy-full:latest"); err != nil {
+		return fmt.Errorf("failed to pull buildpack image: %v", err)
+	}
+	printStatus("Buildpack image pulled successfully")
 	return nil
 }
