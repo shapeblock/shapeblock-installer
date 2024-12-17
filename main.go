@@ -1102,6 +1102,10 @@ func install(config *Config, backendConfig *BackendConfig) error {
 		}
 	}
 
+	if err := installPrometheusStack(config); err != nil {
+		return fmt.Errorf("failed to install Prometheus Stack: %v", err)
+	}
+
 	return nil
 }
 
@@ -1780,6 +1784,8 @@ deployments:
         httpGet:
           path: /ready/
           port: 8000
+        initialDelaySeconds: 60
+        periodSeconds: 180
 
     podLabels:
       app: shapeblock
@@ -2146,6 +2152,8 @@ deployments:
         httpGet:
           path: /login
           port: 3000
+        initialDelaySeconds: 100
+        periodSeconds: 180
       resources:
         limits:
           cpu: "1"
@@ -2870,5 +2878,313 @@ func pullBuildpackImage() error {
 		return fmt.Errorf("failed to pull buildpack image: %v", err)
 	}
 	printStatus("Buildpack image pulled successfully")
+	return nil
+}
+
+func installPrometheusStack(config *Config) error {
+	printStatus("Installing Prometheus Stack...")
+
+	// Check if already installed
+	if resourceExists("deployment", "prometheus-stack-grafana", "monitoring") {
+		printStatus("Prometheus Stack already installed")
+		return nil
+	}
+
+	// Add prometheus-community helm repo
+	if err := addHelmRepo("prometheus-community", "https://prometheus-community.github.io/helm-charts"); err != nil {
+		return err
+	}
+
+	// Create monitoring namespace
+	if err := runCommand("kubectl", "create", "namespace", "monitoring"); err != nil {
+		if !strings.Contains(err.Error(), "already exists") {
+			return fmt.Errorf("failed to create monitoring namespace: %v", err)
+		}
+	}
+
+	// Generate random passwords if not provided
+	promPassword := generatePassword()
+	grafanaPassword := generatePassword()
+
+	// Get domain or use IP if not set
+	domain := config.DomainName
+	if domain == "" {
+		ip, err := getNodeIP()
+		if err != nil {
+			return err
+		}
+		domain = fmt.Sprintf("%s.nip.io", ip)
+	}
+
+	// Create values.yaml content
+	values := fmt.Sprintf(`
+kubeApiServer:
+  enabled: false
+
+kubelet:
+  enabled: true
+  namespace: kube-system
+  serviceMonitor:
+    https: true
+    metricRelabelings:
+      - action: keep
+        sourceLabels: [__name__]
+        regex: '(container_memory_working_set_bytes|container_cpu_usage_seconds_total|container_memory_rss|container_memory_cache|container_memory_swap|container_memory_usage_bytes|container_cpu_cfs_throttled_seconds_total|container_fs_reads_bytes_total|container_fs_writes_bytes_total)'
+
+kubeControllerManager:
+  enabled: false
+
+coreDns:
+  enabled: false
+
+kubeDns:
+  enabled: false
+
+kubeEtcd:
+  enabled: false
+
+kubeScheduler:
+  enabled: false
+
+kubeProxy:
+  enabled: false
+
+nodeExporter:
+  enabled: true
+
+kubeStateMetrics:
+  enabled: true
+
+prometheus:
+  enabled: true
+  prometheusSpec:
+    retention: 24h
+    storageSpec: {}
+    securityContext:
+      fsGroup: 2000
+      runAsNonRoot: true
+      runAsUser: 1000
+    podMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorSelectorNilUsesHelmValues: false
+    basicAuth:
+      enabled: true
+      username: admin
+      password: "%s"
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    annotations:
+      kubernetes.io/ingress.class: nginx
+      cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    hosts:
+      - prometheus.%s
+    tls:
+      - secretName: prometheus-tls
+        hosts:
+          - prometheus.%s
+
+grafana:
+  enabled: true
+  persistence:
+    enabled: false
+  adminPassword: "%s"
+
+  auth:
+    disable_login_form: false
+    signout_redirect_url: ""
+    anonymous:
+      enabled: true
+      org_role: Viewer
+
+  grafana.ini:
+    security:
+      allow_embedding: true
+      cookie_secure: true
+      cookie_samesite: none
+      disable_initial_admin_creation: false
+    auth:
+      disable_login_form: false
+      signout_redirect_url: ""
+    auth.anonymous:
+      enabled: true
+      org_role: Viewer
+    session:
+      provider: memory
+      provider_config: ""
+      cookie_name: grafana_session
+      cookie_secure: true
+      cookie_samesite: none
+      session_life_time: 86400
+
+  defaultDashboardsEnabled: false
+  defaultDashboardsTimezone: utc
+
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+      - name: 'default'
+        orgId: 1
+        folder: ''
+        type: file
+        disableDeletion: false
+        editable: true
+        options:
+          path: /var/lib/grafana/dashboards/default
+
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      searchNamespace: ALL
+      provider:
+        allowUiUpdates: true
+        disableDelete: false
+        folder: ""
+        name: sidecar
+        type: file
+      defaultFolderName: "General"
+
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    annotations:
+      kubernetes.io/ingress.class: nginx
+      cert-manager.io/cluster-issuer: "letsencrypt-prod"
+      nginx.ingress.kubernetes.io/enable-cors: "true"
+      nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, OPTIONS"
+      nginx.ingress.kubernetes.io/cors-allow-credentials: "true"
+      nginx.ingress.kubernetes.io/cors-allow-origin: "*"
+    hosts:
+      - grafana.%s
+    tls:
+      - secretName: grafana-tls
+        hosts:
+          - grafana.%s
+
+alertmanager:
+  enabled: false
+
+defaultRules:
+  create: false
+  rules:
+    alertmanager: false
+    etcd: false
+    general: false
+    k8s: false
+    kubeApiserver: false
+    kubePrometheusNodeAlerting: false
+    kubePrometheusNodeRecording: false
+    kubernetesAbsent: false
+    kubernetesApps: false
+    kubernetesResources: false
+    kubernetesStorage: false
+    kubernetesSystem: false
+    kubeScheduler: false
+    network: false
+    node: false
+    prometheus: false
+    prometheusOperator: false
+    time: false
+`, promPassword, domain, domain, grafanaPassword, domain, domain)
+
+	// Write values to temporary file
+	tmpfile, err := os.CreateTemp("", "prom-values-*.yaml")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	if _, err := tmpfile.WriteString(values); err != nil {
+		return fmt.Errorf("failed to write values: %v", err)
+	}
+	tmpfile.Close()
+
+	// Install Prometheus Stack
+	if err := runCommand("helm", "upgrade", "--install",
+		"prometheus-stack", "prometheus-community/kube-prometheus-stack",
+		"--namespace", "monitoring",
+		"--create-namespace",
+		"--values", tmpfile.Name(),
+		"--timeout", "600s"); err != nil {
+		return fmt.Errorf("failed to install Prometheus Stack: %v", err)
+	}
+
+	// Create dashboard ConfigMaps
+	if err := createGrafanaDashboards(); err != nil {
+		return fmt.Errorf("failed to create Grafana dashboards: %v", err)
+	}
+
+	// Log the credentials
+	logMessage("INFO", fmt.Sprintf("Prometheus credentials - username: admin, password: %s", promPassword))
+	logMessage("INFO", fmt.Sprintf("Grafana credentials - username: admin, password: %s", grafanaPassword))
+
+	printStatus("Prometheus Stack installed successfully")
+	return nil
+}
+
+func createGrafanaDashboards() error {
+	// Read dashboard JSON files
+	podMetrics, err := os.ReadFile("assets/dashboards/pod-metrics-dashboard.json")
+	if err != nil {
+		return fmt.Errorf("failed to read pod metrics dashboard: %v", err)
+	}
+
+	nodeMetrics, err := os.ReadFile("assets/dashboards/node-metrics-dashboard.json")
+	if err != nil {
+		return fmt.Errorf("failed to read node metrics dashboard: %v", err)
+	}
+
+	// Create ConfigMap for pod metrics dashboard
+	podDashboardCM := fmt.Sprintf(`
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pod-metrics-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  pod-metrics-dashboard.json: |-
+    %s
+`, string(podMetrics))
+
+	// Create ConfigMap for node metrics dashboard
+	nodeDashboardCM := fmt.Sprintf(`
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: node-metrics-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  node-metrics-dashboard.json: |-
+    %s
+`, string(nodeMetrics))
+
+	// Write ConfigMaps to temporary files
+	for name, content := range map[string]string{
+		"pod-dashboard-cm.yaml":  podDashboardCM,
+		"node-dashboard-cm.yaml": nodeDashboardCM,
+	} {
+		tmpfile, err := os.CreateTemp("", name)
+		if err != nil {
+			return fmt.Errorf("failed to create temp file: %v", err)
+		}
+		defer os.Remove(tmpfile.Name())
+
+		if _, err := tmpfile.WriteString(content); err != nil {
+			return fmt.Errorf("failed to write ConfigMap: %v", err)
+		}
+		tmpfile.Close()
+
+		// Apply the ConfigMap
+		if err := runCommand("kubectl", "apply", "-f", tmpfile.Name()); err != nil {
+			return fmt.Errorf("failed to apply dashboard ConfigMap %s: %v", name, err)
+		}
+	}
+
 	return nil
 }
