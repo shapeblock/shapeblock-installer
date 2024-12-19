@@ -53,6 +53,9 @@ var logger *log.Logger
 //go:embed assets/epinio/*
 var epinioAssets embed.FS
 
+//go:embed assets/dashboards/*
+var dashboardAssets embed.FS
+
 // Add this near the top of the file with other constants
 var githubToken string // Will be set during compilation
 
@@ -95,6 +98,9 @@ type Config struct {
 	DomainName         string
 	EnableAutoUpdate   bool
 	AllowRegistrations bool
+	AdminFirstName     string
+	AdminLastName      string
+	AppName            string
 }
 
 type BackendConfig struct {
@@ -145,6 +151,18 @@ func NewSpinner(message string) *Spinner {
 		stopChan: make(chan struct{}),
 		message:  message,
 	}
+}
+
+// helper function for slugifying
+func slugify(s string) string {
+	// Convert to lowercase
+	s = strings.ToLower(s)
+	// Replace spaces with hyphens
+	s = strings.ReplaceAll(s, " ", "-")
+	// Remove special characters
+	reg := regexp.MustCompile("[^a-z0-9-]")
+	s = reg.ReplaceAllString(s, "")
+	return s
 }
 
 func (s *Spinner) Start() {
@@ -1078,6 +1096,10 @@ func install(config *Config, backendConfig *BackendConfig) error {
 		return fmt.Errorf("failed to install frontend: %v", err)
 	}
 
+	if err := installPrometheusStack(config); err != nil {
+		return fmt.Errorf("failed to install Prometheus Stack: %v", err)
+	}
+
 	if err := pullBuildpackImage(); err != nil {
 		return fmt.Errorf("failed to pull buildpack image: %v", err)
 	}
@@ -1101,11 +1123,6 @@ func install(config *Config, backendConfig *BackendConfig) error {
 			}
 		}
 	}
-
-	if err := installPrometheusStack(config); err != nil {
-		return fmt.Errorf("failed to install Prometheus Stack: %v", err)
-	}
-
 	return nil
 }
 
@@ -1137,6 +1154,39 @@ func collectInput(config *Config, backendConfig *BackendConfig) error {
 		return fmt.Errorf("prompt failed: %v", err)
 	}
 	config.LicenseKey = result
+
+	prompt = promptui.Prompt{
+		Label:    "Application name",
+		Default:  "ShapeBlock",
+		Validate: validateRequired,
+	}
+	result, err = prompt.Run()
+	if err != nil {
+		return fmt.Errorf("prompt failed: %v", err)
+	}
+	config.AppName = result
+
+	// Admin First Name
+	prompt = promptui.Prompt{
+		Label:    "Admin first name",
+		Validate: validateRequired,
+	}
+	result, err = prompt.Run()
+	if err != nil {
+		return fmt.Errorf("prompt failed: %v", err)
+	}
+	config.AdminFirstName = result
+
+	// Admin Last Name
+	prompt = promptui.Prompt{
+		Label:    "Admin last name",
+		Validate: validateRequired,
+	}
+	result, err = prompt.Run()
+	if err != nil {
+		return fmt.Errorf("prompt failed: %v", err)
+	}
+	config.AdminLastName = result
 
 	// Admin Email
 	prompt = promptui.Prompt{
@@ -1202,8 +1252,9 @@ func collectInput(config *Config, backendConfig *BackendConfig) error {
 
 	// Log collected information (excluding passwords)
 	logMessage("INFO", fmt.Sprintf("Admin email: %s", config.AdminEmail))
+	logMessage("INFO", fmt.Sprintf("App name: %s", config.AppName))
+	logMessage("INFO", fmt.Sprintf("Admin name: %s %s", config.AdminFirstName, config.AdminLastName))
 	logMessage("INFO", fmt.Sprintf("Domain name: %s", config.DomainName))
-
 	return nil
 }
 
@@ -1306,6 +1357,7 @@ func main() {
 		fmt.Println("  shapeblock-installer uninstall")
 		fmt.Println("  shapeblock-installer reset-admin-password")
 		fmt.Println("  shapeblock-installer dump-logs")
+		fmt.Println("  shapeblock-installer create-grafana-dashboards")
 		os.Exit(1)
 	}
 
@@ -1530,6 +1582,15 @@ func main() {
 		}
 		logger.Printf("[%s] Logs dumped successfully", time.Now().Format(logTimeFormat))
 
+	case "create-grafana-dashboards":
+		if err := createGrafanaDashboards(); err != nil {
+			printError(fmt.Sprintf("Failed to create Grafana dashboards: %v", err))
+			logger.Printf("[%s] Failed to create Grafana dashboards: %v", time.Now().Format(logTimeFormat), err)
+			os.Exit(1)
+		}
+		logger.Printf("[%s] Grafana dashboards created successfully", time.Now().Format(logTimeFormat))
+		printStatus("Grafana dashboards created successfully")
+
 	default:
 		fmt.Printf("unknown subcommand: %s\n", os.Args[1])
 		fmt.Println("Usage:")
@@ -1541,6 +1602,7 @@ func main() {
 		fmt.Println("  shapeblock-installer uninstall")
 		fmt.Println("  shapeblock-installer reset-admin-password")
 		fmt.Println("  shapeblock-installer dump-logs")
+		fmt.Println("  shapeblock-installer create-grafana-dashboards")
 		logger.Printf("[%s] Unknown subcommand: %s", time.Now().Format(logTimeFormat), os.Args[1])
 		os.Exit(1)
 	}
@@ -1773,19 +1835,12 @@ deployments:
       ports:
       - containerPort: 8000
         name: app
-      resources:
-        limits:
-          cpu: "500m"
-          memory: "512Mi"
-        requests:
-          cpu: "200m"
-          memory: "512Mi"
       readinessProbe:
         httpGet:
           path: /ready/
           port: 8000
         initialDelaySeconds: 60
-        periodSeconds: 180
+        periodSeconds: 60
 
     podLabels:
       app: shapeblock
@@ -1813,7 +1868,7 @@ envs:
   POSTGRES_PASSWORD: "%s"
   DATABASE_HOST: "db-postgresql"
   REDIS_HOST: "redis-master"
-  ADMIN_URL: "admin-sb-4891/"
+  ADMIN_URL: "admin-%s/"
   SB_TLD: "%s"
   SB_URL: "https://api.%s"
   ALLOWED_HOSTS: api.%s
@@ -1877,6 +1932,7 @@ ingresses:
 		backendConfig.PostgresDatabase,
 		backendConfig.PostgresUsername,
 		backendConfig.PostgresPassword,
+		slugify(config.AppName),
 		domain,
 		domain,
 		domain,
@@ -2080,6 +2136,8 @@ func bootstrapBackend(config *Config, backendConfig *BackendConfig) error {
 		"epinio_token":    epinioToken,
 		"ssh_private_key": string(privateKey),
 		"ssh_public_key":  string(publicKey),
+		"first_name":      config.AdminFirstName,
+		"last_name":       config.AdminLastName,
 	}
 
 	// Convert payload to JSON
@@ -2152,8 +2210,8 @@ deployments:
         httpGet:
           path: /login
           port: 3000
-        initialDelaySeconds: 100
-        periodSeconds: 180
+        initialDelaySeconds: 60
+        periodSeconds: 60
       resources:
         limits:
           cpu: "1"
@@ -2169,7 +2227,7 @@ deployments:
 envs:
   NEXT_PUBLIC_API_URL: https://api.%s/api
   NEXT_PUBLIC_WS_URL: wss://api.%s
-  NEXT_PUBLIC_SAAS_NAME: "ShapeBlock FCL"
+  NEXT_PUBLIC_SAAS_NAME: "%s"
 
 generic:
   labels:
@@ -2202,7 +2260,7 @@ ingresses:
         servicePort: 3000
     ingressClassName: nginx
     name: frontend
-`, latestTag, domain, domain, domain)
+`, latestTag, domain, domain, config.AppName, domain)
 
 	// Log the values being used
 	logMessage("INFO", fmt.Sprintf("Using frontend image tag: %s", latestTag))
@@ -2228,9 +2286,9 @@ ingresses:
 		return fmt.Errorf("failed to install frontend: %v", err)
 	}
 
-	// Wait for 120 seconds before checking readiness
-	printStatus("Waiting 120 seconds before checking frontend readiness...")
-	time.Sleep(120 * time.Second)
+	// Wait for 60 seconds before checking readiness
+	printStatus("Waiting 60 seconds before checking frontend readiness...")
+	time.Sleep(60 * time.Second)
 
 	readinessURL := fmt.Sprintf("https://console.%s/login", domain)
 	printStatus(fmt.Sprintf("Checking frontend readiness at %s...", readinessURL))
@@ -2304,10 +2362,10 @@ Frontend Access:
 - Password: <password provided during installation>
 
 Admin Backend Access:
-- URL: https://api.%s/admin-sb-4891/
+- URL: https://api.%s/admin-%s/
 - Username: admin
 - Password: <password provided during installation>
-`, domain, config.AdminEmail, domain)
+`, domain, config.AdminEmail, domain, config.AppName)
 
 	// Print to console
 	fmt.Println(instructions)
@@ -2639,7 +2697,7 @@ func getLatestImageTag(image string) (string, error) {
 		return "", fmt.Errorf("failed to decode response: %v", err)
 	}
 
-	// Get tags from the first version
+	// Get tags from the version
 	if len(versions) == 0 {
 		return "", fmt.Errorf("no versions found")
 	}
@@ -3125,20 +3183,55 @@ defaultRules:
 }
 
 func createGrafanaDashboards() error {
-	// Read dashboard JSON files
-	podMetrics, err := os.ReadFile("assets/dashboards/pod-metrics-dashboard.json")
+	// Read dashboard JSON files from embedded assets
+	podMetrics, err := dashboardAssets.ReadFile("assets/dashboards/pod-metrics-dashboard.json")
 	if err != nil {
 		return fmt.Errorf("failed to read pod metrics dashboard: %v", err)
 	}
 
-	nodeMetrics, err := os.ReadFile("assets/dashboards/node-metrics-dashboard.json")
+	nodeMetrics, err := dashboardAssets.ReadFile("assets/dashboards/node-metrics-dashboard.json")
 	if err != nil {
 		return fmt.Errorf("failed to read node metrics dashboard: %v", err)
 	}
 
-	// Create ConfigMap for pod metrics dashboard
-	podDashboardCM := fmt.Sprintf(`
-apiVersion: v1
+	// Validate JSON and indent it properly
+	var podJSON, nodeJSON interface{}
+
+	// Parse and re-indent pod metrics JSON
+	if err := json.Unmarshal(podMetrics, &podJSON); err != nil {
+		return fmt.Errorf("failed to parse pod metrics JSON: %v", err)
+	}
+	podMetricsIndented, err := json.MarshalIndent(podJSON, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to indent pod metrics JSON: %v", err)
+	}
+
+	// Parse and re-indent node metrics JSON
+	if err := json.Unmarshal(nodeMetrics, &nodeJSON); err != nil {
+		return fmt.Errorf("failed to parse node metrics JSON: %v", err)
+	}
+	nodeMetricsIndented, err := json.MarshalIndent(nodeJSON, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to indent node metrics JSON: %v", err)
+	}
+
+	// Function to indent each line of the JSON with spaces
+	indentJSON := func(jsonStr string) string {
+		lines := strings.Split(string(jsonStr), "\n")
+		for i, line := range lines {
+			lines[i] = "    " + line
+		}
+		return strings.Join(lines, "\n")
+	}
+
+	// Create ConfigMaps with properly indented JSON
+	dashboards := map[string]struct {
+		name    string
+		content string
+	}{
+		"pod-dashboard": {
+			name: "pod-metrics-dashboard",
+			content: fmt.Sprintf(`apiVersion: v1
 kind: ConfigMap
 metadata:
   name: pod-metrics-dashboard
@@ -3146,13 +3239,12 @@ metadata:
   labels:
     grafana_dashboard: "1"
 data:
-  pod-metrics-dashboard.json: |-
-    %s
-`, string(podMetrics))
-
-	// Create ConfigMap for node metrics dashboard
-	nodeDashboardCM := fmt.Sprintf(`
-apiVersion: v1
+  pod-metrics-dashboard.json: |
+%s`, indentJSON(string(podMetricsIndented))),
+		},
+		"node-dashboard": {
+			name: "node-metrics-dashboard",
+			content: fmt.Sprintf(`apiVersion: v1
 kind: ConfigMap
 metadata:
   name: node-metrics-dashboard
@@ -3160,30 +3252,38 @@ metadata:
   labels:
     grafana_dashboard: "1"
 data:
-  node-metrics-dashboard.json: |-
-    %s
-`, string(nodeMetrics))
+  node-metrics-dashboard.json: |
+%s`, indentJSON(string(nodeMetricsIndented))),
+		},
+	}
 
-	// Write ConfigMaps to temporary files
-	for name, content := range map[string]string{
-		"pod-dashboard-cm.yaml":  podDashboardCM,
-		"node-dashboard-cm.yaml": nodeDashboardCM,
-	} {
-		tmpfile, err := os.CreateTemp("", name)
+	// Apply each dashboard ConfigMap
+	for _, dashboard := range dashboards {
+		// Write ConfigMap to temporary file
+		tmpfile, err := os.CreateTemp("", dashboard.name+"-*.yaml")
 		if err != nil {
-			return fmt.Errorf("failed to create temp file: %v", err)
+			return fmt.Errorf("failed to create temp file for %s: %v", dashboard.name, err)
 		}
 		defer os.Remove(tmpfile.Name())
 
-		if _, err := tmpfile.WriteString(content); err != nil {
-			return fmt.Errorf("failed to write ConfigMap: %v", err)
+		// Log the content for debugging
+		logMessage("DEBUG", fmt.Sprintf("Writing ConfigMap for %s to %s", dashboard.name, tmpfile.Name()))
+		logMessage("DEBUG", fmt.Sprintf("ConfigMap content:\n%s", dashboard.content))
+
+		if _, err := tmpfile.WriteString(dashboard.content); err != nil {
+			return fmt.Errorf("failed to write ConfigMap for %s: %v", dashboard.name, err)
 		}
 		tmpfile.Close()
 
 		// Apply the ConfigMap
-		if err := runCommand("kubectl", "apply", "-f", tmpfile.Name()); err != nil {
-			return fmt.Errorf("failed to apply dashboard ConfigMap %s: %v", name, err)
+		cmd := exec.Command("kubectl", "apply", "-f", tmpfile.Name(), "--kubeconfig=/etc/rancher/k3s/k3s.yaml")
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to apply dashboard ConfigMap %s: %v\nOutput: %s",
+				dashboard.name, err, string(output))
 		}
+
+		logMessage("INFO", fmt.Sprintf("Successfully applied %s dashboard", dashboard.name))
 	}
 
 	return nil
