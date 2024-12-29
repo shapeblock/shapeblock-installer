@@ -1259,11 +1259,41 @@ func collectInput(config *Config, backendConfig *BackendConfig) error {
 }
 
 func setupCronJob(cmd string) error {
-	// Write to crontab
-	cronTab := fmt.Sprintf("crontab -l; echo '%s'", cmd)
-	if err := runCommand("bash", "-c", cronTab); err != nil {
-		return fmt.Errorf("failed to setup cron job: %v", err)
+	// First get existing crontab
+	existingCrontab, err := exec.Command("crontab", "-l").Output()
+	if err != nil && !strings.Contains(err.Error(), "no crontab") {
+		return fmt.Errorf("failed to get existing crontab: %v", err)
 	}
+
+	// Create temporary file for new crontab
+	tmpfile, err := os.CreateTemp("", "crontab-*.txt")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	// Write existing crontab entries (if any) and new command
+	if len(existingCrontab) > 0 {
+		if _, err := tmpfile.Write(existingCrontab); err != nil {
+			return fmt.Errorf("failed to write existing crontab: %v", err)
+		}
+		// Add newline if the existing crontab doesn't end with one
+		if !bytes.HasSuffix(existingCrontab, []byte("\n")) {
+			if _, err := tmpfile.WriteString("\n"); err != nil {
+				return fmt.Errorf("failed to write newline: %v", err)
+			}
+		}
+	}
+	if _, err := tmpfile.WriteString(cmd + "\n"); err != nil {
+		return fmt.Errorf("failed to write new command: %v", err)
+	}
+	tmpfile.Close()
+
+	// Install new crontab
+	if err := exec.Command("crontab", tmpfile.Name()).Run(); err != nil {
+		return fmt.Errorf("failed to install new crontab: %v", err)
+	}
+
 	return nil
 }
 
@@ -1817,13 +1847,6 @@ deployments:
       - envs
       envSecrets:
       - secret-envs
-      resources:
-        limits:
-          cpu: "500m"
-          memory: "512Mi"
-        requests:
-          cpu: "5m"
-          memory: "128Mi"
 
     containers:
     - envConfigmaps:
@@ -2212,13 +2235,6 @@ deployments:
           port: 3000
         initialDelaySeconds: 60
         periodSeconds: 60
-      resources:
-        limits:
-          cpu: "1"
-          memory: 2Gi
-        requests:
-          cpu: 200m
-          memory: 512M
     podLabels:
       app: shapeblock
       release: frontend
