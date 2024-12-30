@@ -50,9 +50,6 @@ const (
 var tektonAssets embed.FS
 var logger *log.Logger
 
-//go:embed assets/epinio/*
-var epinioAssets embed.FS
-
 //go:embed assets/dashboards/*
 var dashboardAssets embed.FS
 
@@ -105,8 +102,6 @@ type Config struct {
 
 type BackendConfig struct {
 	ServiceAccountToken string
-	EpinioUsername      string
-	EpinioPassword      string
 	PostgresUsername    string
 	PostgresPassword    string
 	PostgresDatabase    string
@@ -682,92 +677,6 @@ func generatePassword() string {
 	return string(b)
 }
 
-func installEpinio(config *Config, backendConfig *BackendConfig) error {
-	if resourceExists("deployment", "epinio-server", "epinio") {
-		printStatus("Epinio already installed")
-		return nil
-	}
-
-	printStatus("Installing Epinio...")
-
-	// Add Epinio helm repo
-	if err := addHelmRepo("epinio", "https://epinio.github.io/helm-charts"); err != nil {
-		return err
-	}
-
-	if err := runCommand("helm", "repo", "update"); err != nil {
-		printError(fmt.Sprintf("Failed to update helm repos: %v", err))
-		return err
-	}
-
-	// Determine domain
-	var domain string
-	if config.DomainName != "" {
-		domain = config.DomainName
-	} else {
-		ip, err := getNodeIP()
-		if err != nil {
-			return err
-		}
-		domain = fmt.Sprintf("%s.nip.io", ip)
-	}
-
-	// Set Epinio credentials
-	backendConfig.EpinioUsername = "shapeblock"
-	backendConfig.EpinioPassword = generatePassword()
-
-	printStatus(fmt.Sprintf("Generated Epinio password: %s", backendConfig.EpinioPassword))
-	logMessage("INFO", fmt.Sprintf("Epinio credentials - username: %s, password: %s",
-		backendConfig.EpinioUsername, backendConfig.EpinioPassword))
-
-	// Create values.yaml
-	values := fmt.Sprintf(`
-global:
-  domain: %s
-  tlsIssuer: letsencrypt-prod
-  tlsIssuerEmail: %s
-  dex:
-    enabled: false
-ingress:
-  ingressClassName: nginx
-api:
-  users:
-    - username: %s
-      password: %s
-      roles: ["admin"]
-epinioUI:
-  enabled: false
-`, domain, config.AdminEmail, backendConfig.EpinioUsername, backendConfig.EpinioPassword)
-
-	// Write values to temporary file
-	tmpfile, err := os.CreateTemp("", "epinio-values-*.yaml")
-	if err != nil {
-		printError(fmt.Sprintf("Failed to create temp file: %v", err))
-		return err
-	}
-	defer os.Remove(tmpfile.Name())
-
-	if _, err := tmpfile.WriteString(values); err != nil {
-		printError(fmt.Sprintf("Failed to write values: %v", err))
-		return err
-	}
-	tmpfile.Close()
-
-	// Install Epinio
-	if err := runCommand("helm", "upgrade", "--install",
-		"epinio", "epinio/epinio",
-		"--version", "1.11.1",
-		"--namespace", "epinio",
-		"--create-namespace",
-		"--values", tmpfile.Name(),
-		"--timeout", "600s"); err != nil {
-		printError(fmt.Sprintf("Failed to install Epinio: %v", err))
-		return err
-	}
-
-	return nil
-}
-
 func installPostgres(name, username, database string, backendConfig *BackendConfig) error {
 	printStatus(fmt.Sprintf("Installing PostgreSQL instance %s...", name))
 
@@ -924,49 +833,6 @@ master:
 	return nil
 }
 
-func installEpinioResources() error {
-	printStatus("Installing Epinio resources...")
-
-	resources := []string{
-		"assets/epinio/mongodb-sb.yaml",
-		"assets/epinio/mysql-sb.yaml",
-		"assets/epinio/postgresql-sb.yaml",
-		"assets/epinio/redis-sb.yaml",
-	}
-
-	for _, resource := range resources {
-		// Read embedded file
-		content, err := epinioAssets.ReadFile(resource)
-		if err != nil {
-			printError(fmt.Sprintf("Failed to read resource %s: %v", resource, err))
-			return err
-		}
-
-		// Create temporary file
-		tmpfile, err := os.CreateTemp("", "epinio-*.yaml")
-		if err != nil {
-			printError(fmt.Sprintf("Failed to create temp file: %v", err))
-			return err
-		}
-		defer os.Remove(tmpfile.Name())
-
-		// Write content to temp file
-		if _, err := tmpfile.Write(content); err != nil {
-			printError(fmt.Sprintf("Failed to write to temp file: %v", err))
-			return err
-		}
-		tmpfile.Close()
-
-		// Apply the resource
-		if err := runCommand("kubectl", "apply", "-f", tmpfile.Name(), "--kubeconfig=/etc/rancher/k3s/k3s.yaml", "-n", "epinio"); err != nil {
-			printError(fmt.Sprintf("Failed to install Epinio resource %s: %v", resource, err))
-			return err
-		}
-	}
-
-	return nil
-}
-
 func install(config *Config, backendConfig *BackendConfig) error {
 	// Check if Kubernetes is already installed
 	printStatus("Checking if Kubernetes is already installed...")
@@ -1056,10 +922,6 @@ func install(config *Config, backendConfig *BackendConfig) error {
 		return fmt.Errorf("failed to create service account: %v", err)
 	}
 
-	if err := installEpinio(config, backendConfig); err != nil {
-		return fmt.Errorf("failed to install Epinio: %v", err)
-	}
-
 	// Install main PostgreSQL instance
 	if err := installPostgres("db", "shapeblock", "shapeblock", backendConfig); err != nil {
 		return fmt.Errorf("failed to install main PostgreSQL: %v", err)
@@ -1077,10 +939,6 @@ func install(config *Config, backendConfig *BackendConfig) error {
 
 	if err := installRedis(); err != nil {
 		return fmt.Errorf("failed to install Redis: %v", err)
-	}
-
-	if err := installEpinioResources(); err != nil {
-		return fmt.Errorf("failed to install Epinio resources: %v", err)
 	}
 
 	if err := installBackend(config, backendConfig); err != nil {
@@ -2126,14 +1984,6 @@ func bootstrapBackend(config *Config, backendConfig *BackendConfig) error {
 		return fmt.Errorf("failed to read kubeconfig: %v", err)
 	}
 
-	// Prepare epinio URL and token
-	domain := config.DomainName
-	if domain == "" {
-		domain = fmt.Sprintf("%s.nip.io", ip)
-	}
-	epinioURL := fmt.Sprintf("https://epinio.%s", domain)
-	epinioToken := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", backendConfig.EpinioUsername, backendConfig.EpinioPassword)))
-
 	// Prepare request payload
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -2155,8 +2005,6 @@ func bootstrapBackend(config *Config, backendConfig *BackendConfig) error {
 		"password":        config.AdminPassword,
 		"ip":              ip,
 		"kubeconfig":      string(kubeconfig),
-		"epinio_url":      epinioURL,
-		"epinio_token":    epinioToken,
 		"ssh_private_key": string(privateKey),
 		"ssh_public_key":  string(publicKey),
 		"first_name":      config.AdminFirstName,
