@@ -54,6 +54,9 @@ var logger *log.Logger
 //go:embed assets/dashboards/*
 var dashboardAssets embed.FS
 
+//go:embed assets/kpack/*
+var kpackAssets embed.FS
+
 // Add this near the top of the file with other constants
 var githubToken string // Will be set during compilation
 
@@ -958,6 +961,15 @@ func install(config *Config, backendConfig *BackendConfig) error {
 	// Install Docker Registry
 	if err := installRegistry(config); err != nil {
 		return fmt.Errorf("failed to install registry: %v", err)
+	}
+
+	// Install kpack
+	if err := installKpack(); err != nil {
+		return fmt.Errorf("failed to install kpack: %v", err)
+	}
+
+	if err := installKpackResources(); err != nil {
+		return fmt.Errorf("failed to install kpack resources: %v", err)
 	}
 
 	if err := installPrometheusStack(config); err != nil {
@@ -3221,5 +3233,86 @@ func installRegistry(config *Config) error {
 	printStatus("  Username: shapeblock")
 	printStatus(fmt.Sprintf("  Password: %s", password))
 
+	return nil
+}
+
+func installKpack() error {
+	printStatus("Installing kpack...")
+
+	// Check if kpack already exists
+	if resourceExists("deployment", "kpack-controller", "kpack") {
+		printStatus("kpack already installed")
+		return nil
+	}
+
+	// Create kpack namespace
+	if err := runCommand("kubectl", "create", "namespace", "kpack"); err != nil {
+		if !strings.Contains(err.Error(), "already exists") {
+			return fmt.Errorf("failed to create kpack namespace: %v", err)
+		}
+	}
+
+	// Add shapeblock helm repo
+	if err := addHelmRepo("shapeblock", "https://shapeblock.github.io"); err != nil {
+		return err
+	}
+
+	// Install kpack using helm
+	if err := runCommand("helm", "install", "kpack",
+		"shapeblock/sb-kpack",
+		"--version", "0.1.7",
+		"--namespace", "shapeblock",
+		"--timeout", "600s"); err != nil {
+		return fmt.Errorf("failed to install kpack: %v", err)
+	}
+
+	printStatus("kpack installed successfully")
+	return nil
+}
+
+func installKpackResources() error {
+	printStatus("Installing/Updating kpack resources...")
+
+	resources := []string{
+		"assets/kpack/cluster-stack.yaml",
+		"assets/kpack/go-clusterstore.yaml",
+		"assets/kpack/nginx-clusterstore.yaml",
+		"assets/kpack/node-clusterstore.yaml",
+		"assets/kpack/python-clusterstore.yaml",
+		"assets/kpack/ruby-clusterstore.yaml",
+		"assets/kpack/sb-php-clusterstore.yaml",
+	}
+
+	for _, resource := range resources {
+		// Read embedded file
+		content, err := kpackAssets.ReadFile(resource)
+		if err != nil {
+			printError(fmt.Sprintf("Failed to read resource %s: %v", resource, err))
+			return err
+		}
+
+		// Create temporary file
+		tmpfile, err := os.CreateTemp("", "kpack-*.yaml")
+		if err != nil {
+			printError(fmt.Sprintf("Failed to create temp file: %v", err))
+			return err
+		}
+		defer os.Remove(tmpfile.Name())
+
+		// Write content to temp file
+		if _, err := tmpfile.Write(content); err != nil {
+			printError(fmt.Sprintf("Failed to write to temp file: %v", err))
+			return err
+		}
+		tmpfile.Close()
+
+		// Apply the resource
+		if err := runCommand("kubectl", "apply", "-f", tmpfile.Name()); err != nil {
+			printError(fmt.Sprintf("Failed to install kpack resource %s: %v", resource, err))
+			return err
+		}
+	}
+
+	printStatus("kpack resources installed successfully")
 	return nil
 }
