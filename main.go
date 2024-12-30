@@ -22,6 +22,7 @@ import (
 	"embed"
 
 	"github.com/manifoldco/promptui"
+	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/exp/rand"
 )
 
@@ -954,12 +955,13 @@ func install(config *Config, backendConfig *BackendConfig) error {
 		return fmt.Errorf("failed to install frontend: %v", err)
 	}
 
-	if err := installPrometheusStack(config); err != nil {
-		return fmt.Errorf("failed to install Prometheus Stack: %v", err)
+	// Install Docker Registry
+	if err := installRegistry(config); err != nil {
+		return fmt.Errorf("failed to install registry: %v", err)
 	}
 
-	if err := pullBuildpackImage(); err != nil {
-		return fmt.Errorf("failed to pull buildpack image: %v", err)
+	if err := installPrometheusStack(config); err != nil {
+		return fmt.Errorf("failed to install Prometheus Stack: %v", err)
 	}
 
 	if err := printInstructions(config); err != nil {
@@ -2017,6 +2019,16 @@ func bootstrapBackend(config *Config, backendConfig *BackendConfig) error {
 		return fmt.Errorf("failed to marshal payload: %v", err)
 	}
 
+	// Get domain or use IP if not set
+	domain := config.DomainName
+	if domain == "" {
+		ip, err := getNodeIP()
+		if err != nil {
+			return fmt.Errorf("failed to get node IP: %v", err)
+		}
+		domain = fmt.Sprintf("%s.nip.io", ip)
+	}
+
 	// Make the API call
 	url := fmt.Sprintf("https://api.%s/api/auth/bootstrap/", domain)
 
@@ -2794,15 +2806,6 @@ func dumpLogs() error {
 	return nil
 }
 
-func pullBuildpackImage() error {
-	printStatus("Pulling buildpack image...")
-	if err := runCommand("k3s", "ctr", "images", "pull", "docker.io/paketobuildpacks/builder-jammy-full:latest"); err != nil {
-		return fmt.Errorf("failed to pull buildpack image: %v", err)
-	}
-	printStatus("Buildpack image pulled successfully")
-	return nil
-}
-
 func installPrometheusStack(config *Config) error {
 	printStatus("Installing Prometheus Stack...")
 
@@ -3149,6 +3152,74 @@ data:
 
 		logMessage("INFO", fmt.Sprintf("Successfully applied %s dashboard", dashboard.name))
 	}
+
+	return nil
+}
+
+func installRegistry(config *Config) error {
+	printStatus("Installing Docker Registry...")
+
+	// Check if registry already exists
+	if resourceExists("deployment", "registry-docker-registry", "shapeblock") {
+		printStatus("Docker Registry already installed")
+		return nil
+	}
+
+	// Generate registry password
+	password := generatePassword()
+
+	// Generate bcrypt hash of the password using golang's bcrypt
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return fmt.Errorf("failed to generate password hash: %v", err)
+	}
+	encryptedPassword := string(hashedPassword)
+
+	// Add helm repo
+	if err := addHelmRepo("twuni", "https://helm.twun.io"); err != nil {
+		return err
+	}
+
+	if err := runCommand("helm", "repo", "update"); err != nil {
+		return fmt.Errorf("failed to update helm repos: %v", err)
+	}
+
+	// Get domain or use IP if not set
+	domain := config.DomainName
+	if domain == "" {
+		ip, err := getNodeIP()
+		if err != nil {
+			return fmt.Errorf("failed to get node IP: %v", err)
+		}
+		domain = fmt.Sprintf("%s.nip.io", ip)
+	}
+
+	// Install registry
+	registryDomain := "registry." + domain
+	args := []string{
+		"install", "registry", "twuni/docker-registry",
+		"--version", "2.2.3",
+		"--namespace", "shapeblock",
+		"--set", "persistence.enabled=true",
+		"--set", "persistence.size=10Gi",
+		"--set", "ingress.enabled=true",
+		"--set", fmt.Sprintf("ingress.hosts[0]=%s", registryDomain),
+		"--set", fmt.Sprintf("ingress.tls[0].hosts[0]=%s", registryDomain),
+		"--set", "ingress.tls[0].secretName=registry-tls",
+		"--set", "ingress.annotations.cert-manager\\.io/cluster-issuer=letsencrypt-prod",
+		"--set", "ingress.annotations.nginx\\.ingress\\.kubernetes\\.io/proxy-body-size=0",
+		"--set", fmt.Sprintf("secrets.htpasswd=shapeblock:%s", encryptedPassword),
+		"--set", "updateStrategy.type=Recreate",
+	}
+
+	if err := runCommand("helm", args...); err != nil {
+		return fmt.Errorf("failed to install registry: %v", err)
+	}
+
+	printStatus(fmt.Sprintf("Docker Registry installed successfully at %s", registryDomain))
+	printStatus("Registry credentials:")
+	printStatus("  Username: shapeblock")
+	printStatus(fmt.Sprintf("  Password: %s", password))
 
 	return nil
 }
