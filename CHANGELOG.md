@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Install container registry
 - Install kpack
 - Install kpack cluster stores and cluster stacks
+- Install Flux2 Helm operator
+- Install Helm repository custom resources
 
 ### Changed
 

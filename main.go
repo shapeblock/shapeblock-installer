@@ -57,6 +57,9 @@ var dashboardAssets embed.FS
 //go:embed assets/kpack/*
 var kpackAssets embed.FS
 
+//go:embed assets/helm-repos/*
+var helmReposAssets embed.FS
+
 // Add this near the top of the file with other constants
 var githubToken string // Will be set during compilation
 
@@ -968,8 +971,19 @@ func install(config *Config, backendConfig *BackendConfig) error {
 		return fmt.Errorf("failed to install kpack: %v", err)
 	}
 
+	// Install kpack resources
 	if err := installKpackResources(); err != nil {
 		return fmt.Errorf("failed to install kpack resources: %v", err)
+	}
+
+	// Install Flux2 Helm operator
+	if err := installFlux2(); err != nil {
+		return fmt.Errorf("failed to install Flux2: %v", err)
+	}
+
+	// Install Helm repository custom resources
+	if err := installHelmRepos(); err != nil {
+		return fmt.Errorf("failed to install Helm repository custom resources: %v", err)
 	}
 
 	if err := installPrometheusStack(config); err != nil {
@@ -3314,5 +3328,82 @@ func installKpackResources() error {
 	}
 
 	printStatus("kpack resources installed successfully")
+	return nil
+}
+
+func installFlux2() error {
+	printStatus("Installing Flux2 Helm operator...")
+
+	// Check if Flux2 already exists
+	if resourceExists("deployment", "helm-operator-flux2-helm-controller", "shapeblock") {
+		printStatus("Flux2 Helm operator already installed")
+		return nil
+	}
+
+	// Add fluxcd-community helm repo
+	if err := addHelmRepo("fluxcd-community", "https://fluxcd-community.github.io/helm-charts"); err != nil {
+		return err
+	}
+
+	// Install Flux2 using helm
+	if err := runCommand("helm", "install", "helm-operator",
+		"fluxcd-community/flux2",
+		"--version", "2.13.0",
+		"--namespace", "shapeblock",
+		"--set", "imageAutomationController.create=false",
+		"--set", "imageReflectorController.create=false",
+		"--set", "kustomizeController.create=false",
+		"--timeout", "600s"); err != nil {
+		return fmt.Errorf("failed to install Flux2: %v", err)
+	}
+
+	printStatus("Flux2 Helm operator installed successfully")
+	return nil
+}
+
+func installHelmRepos() error {
+	printStatus("Installing Helm repository custom resources...")
+
+	// Read the directory contents
+	entries, err := helmReposAssets.ReadDir("assets/helm-repos")
+	if err != nil {
+		return fmt.Errorf("failed to read helm repos directory: %v", err)
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".yaml") {
+			// Read embedded file
+			content, err := helmReposAssets.ReadFile(fmt.Sprintf("assets/helm-repos/%s", entry.Name()))
+			if err != nil {
+				printError(fmt.Sprintf("Failed to read helm repo CR %s: %v", entry.Name(), err))
+				return err
+			}
+
+			// Create temporary file
+			tmpfile, err := os.CreateTemp("", "helm-repo-*.yaml")
+			if err != nil {
+				printError(fmt.Sprintf("Failed to create temp file: %v", err))
+				return err
+			}
+			defer os.Remove(tmpfile.Name())
+
+			// Write content to temp file
+			if _, err := tmpfile.Write(content); err != nil {
+				printError(fmt.Sprintf("Failed to write to temp file: %v", err))
+				return err
+			}
+			tmpfile.Close()
+
+			// Apply the resource
+			if err := runCommand("kubectl", "apply", "-f", tmpfile.Name(), "-n", "shapeblock"); err != nil {
+				printError(fmt.Sprintf("Failed to install helm repo CR %s: %v", entry.Name(), err))
+				return err
+			}
+
+			printStatus(fmt.Sprintf("Installed helm repo CR: %s", entry.Name()))
+		}
+	}
+
+	printStatus("Helm repository custom resources installed successfully")
 	return nil
 }
