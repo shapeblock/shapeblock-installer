@@ -986,6 +986,10 @@ func install(config *Config, backendConfig *BackendConfig) error {
 		return fmt.Errorf("failed to install Helm repository custom resources: %v", err)
 	}
 
+	if err := installSBOperator(config); err != nil {
+		return fmt.Errorf("failed to install ShapeBlock operator: %v", err)
+	}
+
 	if err := installPrometheusStack(config); err != nil {
 		return fmt.Errorf("failed to install Prometheus Stack: %v", err)
 	}
@@ -3405,5 +3409,99 @@ func installHelmRepos() error {
 	}
 
 	printStatus("Helm repository custom resources installed successfully")
+	return nil
+}
+
+func installSBOperator(config *Config) error {
+	printStatus("Installing ShapeBlock operator...")
+
+	// Check if operator already exists
+	if resourceExists("deployment", "sb-operator", "shapeblock") {
+		printStatus("ShapeBlock operator already installed")
+		return nil
+	}
+
+	// Get domain or use IP if not set
+	domain := config.DomainName
+	if domain == "" {
+		ip, err := getNodeIP()
+		if err != nil {
+			return fmt.Errorf("failed to get node IP: %v", err)
+		}
+		domain = fmt.Sprintf("%s.nip.io", ip)
+	}
+
+	// Create operator YAML
+	operatorYAML := fmt.Sprintf(`apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: shapeblock-admin
+  namespace: shapeblock
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: shapeblock-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: shapeblock-admin
+  namespace: shapeblock
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sb-operator
+  namespace: shapeblock
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      application: sb-operator
+  template:
+    metadata:
+      labels:
+        application: sb-operator
+    spec:
+      serviceAccountName: shapeblock-admin
+      containers:
+      - name: sb-operator
+        image: shapeblock/sb-operator:20-dec-2024.1
+        imagePullPolicy: Always
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /healthz
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 5
+          periodSeconds: 30
+        env:
+          - name: SB_URL
+            value: https://api.%s`, domain)
+
+	// Write YAML to temporary file
+	tmpfile, err := os.CreateTemp("", "sb-operator-*.yaml")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	if _, err := tmpfile.WriteString(operatorYAML); err != nil {
+		return fmt.Errorf("failed to write operator YAML: %v", err)
+	}
+	tmpfile.Close()
+
+	// Apply the operator resources
+	if err := runCommand("kubectl", "apply", "-f", tmpfile.Name()); err != nil {
+		return fmt.Errorf("failed to install ShapeBlock operator: %v", err)
+	}
+
+	printStatus("ShapeBlock operator installed successfully")
 	return nil
 }

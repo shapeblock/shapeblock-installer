@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Install kpack cluster stores and cluster stacks
 - Install Flux2 Helm operator
 - Install Helm repository custom resources
-
+- Install ShapeBlock operator
 ### Changed
 
 - Fix cron job creation
