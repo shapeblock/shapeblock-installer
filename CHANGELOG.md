@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Install Flux2 Helm operator
 - Install Helm repository custom resources
 - Install ShapeBlock operator
+- Registry credentials secret
+- App and project CRDs
+
 ### Changed
 
 - Fix cron job creation

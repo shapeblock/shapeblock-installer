@@ -60,6 +60,9 @@ var kpackAssets embed.FS
 //go:embed assets/helm-repos/*
 var helmReposAssets embed.FS
 
+//go:embed assets/shapeblock/*
+var shapeblockcrdAssets embed.FS
+
 // Add this near the top of the file with other constants
 var githubToken string // Will be set during compilation
 
@@ -1013,6 +1016,11 @@ func install(config *Config, backendConfig *BackendConfig) error {
 			}
 		}
 	}
+
+	if err := installShapeBlockCRDs(); err != nil {
+		return fmt.Errorf("failed to install ShapeBlock CRDs: %v", err)
+	}
+
 	return nil
 }
 
@@ -3246,6 +3254,42 @@ func installRegistry(config *Config) error {
 		return fmt.Errorf("failed to install registry: %v", err)
 	}
 
+	// Create registry credentials secret
+	dockerConfig := fmt.Sprintf(`{
+		"auths": {
+			"%s": {
+				"auth": "%s"
+			}
+		}
+	}`, registryDomain, base64.StdEncoding.EncodeToString([]byte("shapeblock:"+password)))
+
+	// Create temporary file for the secret
+	tmpfile, err := os.CreateTemp("", "registry-secret-*.yaml")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	secretYAML := fmt.Sprintf(`apiVersion: v1
+kind: Secret
+metadata:
+  name: registry-creds
+  namespace: shapeblock
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: %s
+`, base64.StdEncoding.EncodeToString([]byte(dockerConfig)))
+
+	if _, err := tmpfile.WriteString(secretYAML); err != nil {
+		return fmt.Errorf("failed to write secret YAML: %v", err)
+	}
+	tmpfile.Close()
+
+	// Apply the secret
+	if err := runCommand("kubectl", "apply", "-f", tmpfile.Name()); err != nil {
+		return fmt.Errorf("failed to create registry credentials secret: %v", err)
+	}
+
 	printStatus(fmt.Sprintf("Docker Registry installed successfully at %s", registryDomain))
 	printStatus("Registry credentials:")
 	printStatus("  Username: shapeblock")
@@ -3503,5 +3547,52 @@ spec:
 	}
 
 	printStatus("ShapeBlock operator installed successfully")
+	return nil
+}
+
+func installShapeBlockCRDs() error {
+	printStatus("Installing ShapeBlock CRDs...")
+
+	// Read the directory contents
+	entries, err := shapeblockcrdAssets.ReadDir("assets/shapeblock")
+	if err != nil {
+		return fmt.Errorf("failed to read shapeblock CRDs directory: %v", err)
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".yaml") {
+			// Read embedded file
+			content, err := shapeblockcrdAssets.ReadFile(fmt.Sprintf("assets/shapeblock/%s", entry.Name()))
+			if err != nil {
+				printError(fmt.Sprintf("Failed to read ShapeBlock CRD %s: %v", entry.Name(), err))
+				return err
+			}
+
+			// Create temporary file
+			tmpfile, err := os.CreateTemp("", "shapeblock-crd-*.yaml")
+			if err != nil {
+				printError(fmt.Sprintf("Failed to create temp file: %v", err))
+				return err
+			}
+			defer os.Remove(tmpfile.Name())
+
+			// Write content to temp file
+			if _, err := tmpfile.Write(content); err != nil {
+				printError(fmt.Sprintf("Failed to write to temp file: %v", err))
+				return err
+			}
+			tmpfile.Close()
+
+			// Apply the CRD
+			if err := runCommand("kubectl", "apply", "-f", tmpfile.Name()); err != nil {
+				printError(fmt.Sprintf("Failed to install ShapeBlock CRD %s: %v", entry.Name(), err))
+				return err
+			}
+
+			printStatus(fmt.Sprintf("Installed ShapeBlock CRD: %s", entry.Name()))
+		}
+	}
+
+	printStatus("ShapeBlock CRDs installed successfully")
 	return nil
 }
