@@ -1,0 +1,10 @@
+apiVersion: source.toolkit.fluxcd.io/v1beta2
+kind: OCIRepository
+metadata:
+  name: bitnami
+  namespace: shapeblock
+spec:
+  interval: 1m
+  url: oci://registry-1.docker.io/bitnamicharts/mysql
+  ref:
+    semver: ">12.0.0"

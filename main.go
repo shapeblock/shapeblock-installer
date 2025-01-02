@@ -22,6 +22,7 @@ import (
 	"embed"
 
 	"github.com/manifoldco/promptui"
+	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/exp/rand"
 )
 
@@ -50,11 +51,17 @@ const (
 var tektonAssets embed.FS
 var logger *log.Logger
 
-//go:embed assets/epinio/*
-var epinioAssets embed.FS
-
 //go:embed assets/dashboards/*
 var dashboardAssets embed.FS
+
+//go:embed assets/kpack/*
+var kpackAssets embed.FS
+
+//go:embed assets/helm-repos/*
+var helmReposAssets embed.FS
+
+//go:embed assets/shapeblock/*
+var shapeblockcrdAssets embed.FS
 
 // Add this near the top of the file with other constants
 var githubToken string // Will be set during compilation
@@ -105,8 +112,6 @@ type Config struct {
 
 type BackendConfig struct {
 	ServiceAccountToken string
-	EpinioUsername      string
-	EpinioPassword      string
 	PostgresUsername    string
 	PostgresPassword    string
 	PostgresDatabase    string
@@ -114,7 +119,6 @@ type BackendConfig struct {
 	TFStateUsername     string
 	TFStatePassword     string
 	TFStateDatabase     string
-	TFStateRootPW       string
 	LicenseKey          string
 }
 
@@ -682,97 +686,11 @@ func generatePassword() string {
 	return string(b)
 }
 
-func installEpinio(config *Config, backendConfig *BackendConfig) error {
-	if resourceExists("deployment", "epinio-server", "epinio") {
-		printStatus("Epinio already installed")
-		return nil
-	}
+func installPostgres(backendConfig *BackendConfig) error {
+	printStatus("Installing PostgreSQL...")
 
-	printStatus("Installing Epinio...")
-
-	// Add Epinio helm repo
-	if err := addHelmRepo("epinio", "https://epinio.github.io/helm-charts"); err != nil {
-		return err
-	}
-
-	if err := runCommand("helm", "repo", "update"); err != nil {
-		printError(fmt.Sprintf("Failed to update helm repos: %v", err))
-		return err
-	}
-
-	// Determine domain
-	var domain string
-	if config.DomainName != "" {
-		domain = config.DomainName
-	} else {
-		ip, err := getNodeIP()
-		if err != nil {
-			return err
-		}
-		domain = fmt.Sprintf("%s.nip.io", ip)
-	}
-
-	// Set Epinio credentials
-	backendConfig.EpinioUsername = "shapeblock"
-	backendConfig.EpinioPassword = generatePassword()
-
-	printStatus(fmt.Sprintf("Generated Epinio password: %s", backendConfig.EpinioPassword))
-	logMessage("INFO", fmt.Sprintf("Epinio credentials - username: %s, password: %s",
-		backendConfig.EpinioUsername, backendConfig.EpinioPassword))
-
-	// Create values.yaml
-	values := fmt.Sprintf(`
-global:
-  domain: %s
-  tlsIssuer: letsencrypt-prod
-  tlsIssuerEmail: %s
-  dex:
-    enabled: false
-ingress:
-  ingressClassName: nginx
-api:
-  users:
-    - username: %s
-      password: %s
-      roles: ["admin"]
-epinioUI:
-  enabled: false
-`, domain, config.AdminEmail, backendConfig.EpinioUsername, backendConfig.EpinioPassword)
-
-	// Write values to temporary file
-	tmpfile, err := os.CreateTemp("", "epinio-values-*.yaml")
-	if err != nil {
-		printError(fmt.Sprintf("Failed to create temp file: %v", err))
-		return err
-	}
-	defer os.Remove(tmpfile.Name())
-
-	if _, err := tmpfile.WriteString(values); err != nil {
-		printError(fmt.Sprintf("Failed to write values: %v", err))
-		return err
-	}
-	tmpfile.Close()
-
-	// Install Epinio
-	if err := runCommand("helm", "upgrade", "--install",
-		"epinio", "epinio/epinio",
-		"--version", "1.11.1",
-		"--namespace", "epinio",
-		"--create-namespace",
-		"--values", tmpfile.Name(),
-		"--timeout", "600s"); err != nil {
-		printError(fmt.Sprintf("Failed to install Epinio: %v", err))
-		return err
-	}
-
-	return nil
-}
-
-func installPostgres(name, username, database string, backendConfig *BackendConfig) error {
-	printStatus(fmt.Sprintf("Installing PostgreSQL instance %s...", name))
-
-	if resourceExists("statefulset", name+"-postgresql", "shapeblock") {
-		printStatus(fmt.Sprintf("PostgreSQL instance %s already installed", name))
+	if resourceExists("statefulset", "db-postgresql", "shapeblock") {
+		printStatus("PostgreSQL already installed")
 		return nil
 	}
 
@@ -780,29 +698,27 @@ func installPostgres(name, username, database string, backendConfig *BackendConf
 		return err
 	}
 
-	// Generate passwords
-	password := generatePassword()
+	// Generate passwords for both users and root
+	mainPassword := generatePassword()
+	tfstatePassword := generatePassword()
 	rootPW := generatePassword()
 
-	// Store credentials based on instance name
-	switch name {
-	case "db":
-		backendConfig.PostgresUsername = username
-		backendConfig.PostgresDatabase = database
-		backendConfig.PostgresPassword = password
-		backendConfig.PostgresRootPW = rootPW
-	case "tfstate":
-		backendConfig.TFStateUsername = username
-		backendConfig.TFStateDatabase = database
-		backendConfig.TFStatePassword = password
-		backendConfig.TFStateRootPW = rootPW
-	}
+	// Store credentials in backend config
+	backendConfig.PostgresUsername = "shapeblock"
+	backendConfig.PostgresDatabase = "shapeblock"
+	backendConfig.PostgresPassword = mainPassword
+	backendConfig.PostgresRootPW = rootPW
+	backendConfig.TFStateUsername = "tfstate"
+	backendConfig.TFStateDatabase = "tfstate"
+	backendConfig.TFStatePassword = tfstatePassword
 
 	// Log the credentials for debugging
-	logMessage("INFO", fmt.Sprintf("PostgreSQL %s credentials - username: %s, database: %s, password: %s",
-		name, username, database, password))
+	logMessage("INFO", fmt.Sprintf("PostgreSQL main credentials - username: %s, database: %s, password: %s",
+		backendConfig.PostgresUsername, backendConfig.PostgresDatabase, mainPassword))
+	logMessage("INFO", fmt.Sprintf("PostgreSQL tfstate credentials - username: %s, database: %s, password: %s",
+		backendConfig.TFStateUsername, backendConfig.TFStateDatabase, tfstatePassword))
 
-	// Create values.yaml
+	// Create values with initialization scripts for both databases
 	values := fmt.Sprintf(`
 auth:
   database: %s
@@ -813,13 +729,42 @@ architecture: standalone
 primary:
   persistence:
     size: 2Gi
+  initdb:
+    scripts:
+      init_db_and_users.sql: |
+        -- Create tfstate user and database
+        CREATE USER %s WITH PASSWORD '%s';
+        CREATE DATABASE %s OWNER %s;
+        GRANT ALL PRIVILEGES ON DATABASE %s TO %s;
+
+        -- Create shapeblock user and database
+        CREATE USER %s WITH PASSWORD '%s';
+        CREATE DATABASE %s OWNER %s;
+        GRANT ALL PRIVILEGES ON DATABASE %s TO %s;
 tls:
   enabled: true
-  autoGenerated: true
-`, database, username, password, rootPW)
+  autoGenerated: true`,
+		backendConfig.PostgresDatabase, // Initial database
+		backendConfig.PostgresUsername, // Initial user
+		backendConfig.PostgresPassword,
+		backendConfig.PostgresRootPW,
+		// tfstate database and user creation
+		backendConfig.TFStateUsername,
+		backendConfig.TFStatePassword,
+		backendConfig.TFStateDatabase,
+		backendConfig.TFStateUsername,
+		backendConfig.TFStateDatabase,
+		backendConfig.TFStateUsername,
+		// shapeblock database and user creation
+		backendConfig.PostgresUsername,
+		backendConfig.PostgresPassword,
+		backendConfig.PostgresDatabase,
+		backendConfig.PostgresUsername,
+		backendConfig.PostgresDatabase,
+		backendConfig.PostgresUsername)
 
 	// Write values to temporary file
-	tmpfile, err := os.CreateTemp("", fmt.Sprintf("%s-values-*.yaml", name))
+	tmpfile, err := os.CreateTemp("", "postgres-values-*.yaml")
 	if err != nil {
 		printError(fmt.Sprintf("Failed to create temp file: %v", err))
 		return err
@@ -834,16 +779,16 @@ tls:
 
 	// Install PostgreSQL
 	if err := runCommand("helm", "upgrade", "--install",
-		name, "bitnami/postgresql",
+		"db", "bitnami/postgresql",
 		"--version", "16.2.3",
 		"--namespace", "shapeblock",
 		"--values", tmpfile.Name(),
 		"--timeout", "600s"); err != nil {
-		printError(fmt.Sprintf("Failed to install PostgreSQL %s: %v", name, err))
+		printError(fmt.Sprintf("Failed to install PostgreSQL: %v", err))
 		return err
 	}
 
-	printStatus(fmt.Sprintf("PostgreSQL instance %s installed successfully", name))
+	printStatus("PostgreSQL installed successfully with both databases")
 	return nil
 }
 
@@ -856,7 +801,7 @@ func createTerraformSecret(backendConfig *BackendConfig) error {
 	}
 
 	// Create connection string
-	connStr := fmt.Sprintf("postgres://%s:%s@tfstate-postgresql/%s",
+	connStr := fmt.Sprintf("postgres://%s:%s@db-postgresql/%s",
 		backendConfig.TFStateUsername,
 		backendConfig.TFStatePassword,
 		backendConfig.TFStateDatabase)
@@ -921,49 +866,6 @@ master:
 	}
 
 	printStatus("Redis installed successfully")
-	return nil
-}
-
-func installEpinioResources() error {
-	printStatus("Installing Epinio resources...")
-
-	resources := []string{
-		"assets/epinio/mongodb-sb.yaml",
-		"assets/epinio/mysql-sb.yaml",
-		"assets/epinio/postgresql-sb.yaml",
-		"assets/epinio/redis-sb.yaml",
-	}
-
-	for _, resource := range resources {
-		// Read embedded file
-		content, err := epinioAssets.ReadFile(resource)
-		if err != nil {
-			printError(fmt.Sprintf("Failed to read resource %s: %v", resource, err))
-			return err
-		}
-
-		// Create temporary file
-		tmpfile, err := os.CreateTemp("", "epinio-*.yaml")
-		if err != nil {
-			printError(fmt.Sprintf("Failed to create temp file: %v", err))
-			return err
-		}
-		defer os.Remove(tmpfile.Name())
-
-		// Write content to temp file
-		if _, err := tmpfile.Write(content); err != nil {
-			printError(fmt.Sprintf("Failed to write to temp file: %v", err))
-			return err
-		}
-		tmpfile.Close()
-
-		// Apply the resource
-		if err := runCommand("kubectl", "apply", "-f", tmpfile.Name(), "--kubeconfig=/etc/rancher/k3s/k3s.yaml", "-n", "epinio"); err != nil {
-			printError(fmt.Sprintf("Failed to install Epinio resource %s: %v", resource, err))
-			return err
-		}
-	}
-
 	return nil
 }
 
@@ -1056,18 +958,9 @@ func install(config *Config, backendConfig *BackendConfig) error {
 		return fmt.Errorf("failed to create service account: %v", err)
 	}
 
-	if err := installEpinio(config, backendConfig); err != nil {
-		return fmt.Errorf("failed to install Epinio: %v", err)
-	}
-
-	// Install main PostgreSQL instance
-	if err := installPostgres("db", "shapeblock", "shapeblock", backendConfig); err != nil {
-		return fmt.Errorf("failed to install main PostgreSQL: %v", err)
-	}
-
-	// Install TFState PostgreSQL instance
-	if err := installPostgres("tfstate", "tfstate", "tfstate", backendConfig); err != nil {
-		return fmt.Errorf("failed to install TFState PostgreSQL: %v", err)
+	// Install PostgreSQL instance
+	if err := installPostgres(backendConfig); err != nil {
+		return fmt.Errorf("failed to install PostgreSQL: %v", err)
 	}
 
 	// Create Terraform credentials secret
@@ -1077,10 +970,6 @@ func install(config *Config, backendConfig *BackendConfig) error {
 
 	if err := installRedis(); err != nil {
 		return fmt.Errorf("failed to install Redis: %v", err)
-	}
-
-	if err := installEpinioResources(); err != nil {
-		return fmt.Errorf("failed to install Epinio resources: %v", err)
 	}
 
 	if err := installBackend(config, backendConfig); err != nil {
@@ -1096,12 +985,37 @@ func install(config *Config, backendConfig *BackendConfig) error {
 		return fmt.Errorf("failed to install frontend: %v", err)
 	}
 
-	if err := installPrometheusStack(config); err != nil {
-		return fmt.Errorf("failed to install Prometheus Stack: %v", err)
+	// Install Docker Registry
+	if err := installRegistry(config); err != nil {
+		return fmt.Errorf("failed to install registry: %v", err)
 	}
 
-	if err := pullBuildpackImage(); err != nil {
-		return fmt.Errorf("failed to pull buildpack image: %v", err)
+	// Install kpack
+	if err := installKpack(); err != nil {
+		return fmt.Errorf("failed to install kpack: %v", err)
+	}
+
+	// Install kpack resources
+	if err := installKpackResources(); err != nil {
+		return fmt.Errorf("failed to install kpack resources: %v", err)
+	}
+
+	// Install Flux2 Helm operator
+	if err := installFlux2(); err != nil {
+		return fmt.Errorf("failed to install Flux2: %v", err)
+	}
+
+	// Install Helm repository custom resources
+	if err := installHelmRepos(); err != nil {
+		return fmt.Errorf("failed to install Helm repository custom resources: %v", err)
+	}
+
+	if err := installSBOperator(config); err != nil {
+		return fmt.Errorf("failed to install ShapeBlock operator: %v", err)
+	}
+
+	if err := installPrometheusStack(config); err != nil {
+		return fmt.Errorf("failed to install Prometheus Stack: %v", err)
 	}
 
 	if err := printInstructions(config); err != nil {
@@ -1123,6 +1037,11 @@ func install(config *Config, backendConfig *BackendConfig) error {
 			}
 		}
 	}
+
+	if err := installShapeBlockCRDs(); err != nil {
+		return fmt.Errorf("failed to install ShapeBlock CRDs: %v", err)
+	}
+
 	return nil
 }
 
@@ -1870,19 +1789,6 @@ deployments:
       release: backend
     replicas: 1
 
-  worker:
-    containers:
-    - envConfigmaps:
-      - envs
-      envSecrets:
-      - secret-envs
-      name: worker
-      command: ['celery', '-A', 'shapeblock', 'worker', '-l', 'INFO']
-    podLabels:
-      app: shapeblock
-      release: backend
-    replicas: 1
-
 envs:
   DEBUG: "False"
   DATABASE_URL: "postgres://%s:%s@db-postgresql/%s"
@@ -2126,14 +2032,6 @@ func bootstrapBackend(config *Config, backendConfig *BackendConfig) error {
 		return fmt.Errorf("failed to read kubeconfig: %v", err)
 	}
 
-	// Prepare epinio URL and token
-	domain := config.DomainName
-	if domain == "" {
-		domain = fmt.Sprintf("%s.nip.io", ip)
-	}
-	epinioURL := fmt.Sprintf("https://epinio.%s", domain)
-	epinioToken := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", backendConfig.EpinioUsername, backendConfig.EpinioPassword)))
-
 	// Prepare request payload
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -2155,8 +2053,6 @@ func bootstrapBackend(config *Config, backendConfig *BackendConfig) error {
 		"password":        config.AdminPassword,
 		"ip":              ip,
 		"kubeconfig":      string(kubeconfig),
-		"epinio_url":      epinioURL,
-		"epinio_token":    epinioToken,
 		"ssh_private_key": string(privateKey),
 		"ssh_public_key":  string(publicKey),
 		"first_name":      config.AdminFirstName,
@@ -2167,6 +2063,16 @@ func bootstrapBackend(config *Config, backendConfig *BackendConfig) error {
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("failed to marshal payload: %v", err)
+	}
+
+	// Get domain or use IP if not set
+	domain := config.DomainName
+	if domain == "" {
+		ip, err := getNodeIP()
+		if err != nil {
+			return fmt.Errorf("failed to get node IP: %v", err)
+		}
+		domain = fmt.Sprintf("%s.nip.io", ip)
 	}
 
 	// Make the API call
@@ -2381,7 +2287,7 @@ Admin Backend Access:
 - URL: https://api.%s/admin-%s/
 - Username: admin
 - Password: <password provided during installation>
-`, domain, config.AdminEmail, domain, config.AppName)
+`, domain, config.AdminEmail, domain, slugify(config.AppName))
 
 	// Print to console
 	fmt.Println(instructions)
@@ -2513,7 +2419,7 @@ func uninstall() error {
 
 	// Uninstall PostgreSQL instances
 	printStatus("Uninstalling PostgreSQL instances...")
-	for _, instance := range []string{"db", "tfstate"} {
+	for _, instance := range []string{"db"} {
 		if err := runCommand("helm", "uninstall", instance, "-n", "shapeblock"); err != nil {
 			printStatus(fmt.Sprintf("Note: PostgreSQL instance %s was not installed or already removed", instance))
 		}
@@ -2621,6 +2527,55 @@ func uninstall() error {
 			}
 		} else {
 			printStatus(fmt.Sprintf("Removed %s", tool))
+		}
+	}
+
+	// Clean up files
+	printStatus("Cleaning up installation files...")
+
+	// Get home directory
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		printStatus(fmt.Sprintf("Warning: Failed to get home directory: %v", err))
+	} else {
+		// Remove SSH keys
+		sshFiles := []string{
+			filepath.Join(homeDir, "sb"),
+			filepath.Join(homeDir, "sb.pub"),
+		}
+
+		for _, file := range sshFiles {
+			if err := os.Remove(file); err != nil {
+				if !os.IsNotExist(err) {
+					printStatus(fmt.Sprintf("Warning: Failed to remove %s: %v", file, err))
+				}
+			} else {
+				printStatus(fmt.Sprintf("Removed %s", file))
+			}
+		}
+	}
+
+	// Remove installation files from current directory
+	installFiles := []string{
+		"instructions.txt",
+		"kubeconfig",
+	}
+
+	// Add any install*.log files
+	matches, err := filepath.Glob("install*.log")
+	if err != nil {
+		printStatus(fmt.Sprintf("Warning: Failed to find log files: %v", err))
+	} else {
+		installFiles = append(installFiles, matches...)
+	}
+
+	for _, file := range installFiles {
+		if err := os.Remove(file); err != nil {
+			if !os.IsNotExist(err) {
+				printStatus(fmt.Sprintf("Warning: Failed to remove %s: %v", file, err))
+			}
+		} else {
+			printStatus(fmt.Sprintf("Removed %s", file))
 		}
 	}
 
@@ -2943,15 +2898,6 @@ func dumpLogs() error {
 	}
 
 	printStatus(fmt.Sprintf("Logs have been written to %s", logFile))
-	return nil
-}
-
-func pullBuildpackImage() error {
-	printStatus("Pulling buildpack image...")
-	if err := runCommand("k3s", "ctr", "images", "pull", "docker.io/paketobuildpacks/builder-jammy-full:latest"); err != nil {
-		return fmt.Errorf("failed to pull buildpack image: %v", err)
-	}
-	printStatus("Buildpack image pulled successfully")
 	return nil
 }
 
@@ -3302,5 +3248,408 @@ data:
 		logMessage("INFO", fmt.Sprintf("Successfully applied %s dashboard", dashboard.name))
 	}
 
+	return nil
+}
+
+func installRegistry(config *Config) error {
+	printStatus("Installing Docker Registry...")
+
+	// Check if registry already exists
+	if resourceExists("deployment", "registry-docker-registry", "shapeblock") {
+		printStatus("Docker Registry already installed")
+		return nil
+	}
+
+	// Generate registry password
+	password := generatePassword()
+
+	// Generate bcrypt hash of the password using golang's bcrypt
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return fmt.Errorf("failed to generate password hash: %v", err)
+	}
+	encryptedPassword := string(hashedPassword)
+
+	// Add helm repo
+	if err := addHelmRepo("twuni", "https://helm.twun.io"); err != nil {
+		return err
+	}
+
+	if err := runCommand("helm", "repo", "update"); err != nil {
+		return fmt.Errorf("failed to update helm repos: %v", err)
+	}
+
+	// Get domain or use IP if not set
+	domain := config.DomainName
+	if domain == "" {
+		ip, err := getNodeIP()
+		if err != nil {
+			return fmt.Errorf("failed to get node IP: %v", err)
+		}
+		domain = fmt.Sprintf("%s.nip.io", ip)
+	}
+
+	// Install registry
+	registryDomain := "registry." + domain
+	args := []string{
+		"install", "registry", "twuni/docker-registry",
+		"--version", "2.2.3",
+		"--namespace", "shapeblock",
+		"--set", "persistence.enabled=true",
+		"--set", "persistence.size=10Gi",
+		"--set", "ingress.enabled=true",
+		"--set", fmt.Sprintf("ingress.hosts[0]=%s", registryDomain),
+		"--set", fmt.Sprintf("ingress.tls[0].hosts[0]=%s", registryDomain),
+		"--set", "ingress.tls[0].secretName=registry-tls",
+		"--set", "ingress.annotations.cert-manager\\.io/cluster-issuer=letsencrypt-prod",
+		"--set", "ingress.annotations.nginx\\.ingress\\.kubernetes\\.io/proxy-body-size=0",
+		"--set", fmt.Sprintf("secrets.htpasswd=shapeblock:%s", encryptedPassword),
+		"--set", "updateStrategy.type=Recreate",
+	}
+
+	if err := runCommand("helm", args...); err != nil {
+		return fmt.Errorf("failed to install registry: %v", err)
+	}
+
+	// Create registry credentials secret
+	dockerConfig := fmt.Sprintf(`{
+		"auths": {
+			"%s": {
+				"auth": "%s"
+			}
+		}
+	}`, registryDomain, base64.StdEncoding.EncodeToString([]byte("shapeblock:"+password)))
+
+	// Create temporary file for the secret
+	tmpfile, err := os.CreateTemp("", "registry-secret-*.yaml")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	secretYAML := fmt.Sprintf(`apiVersion: v1
+kind: Secret
+metadata:
+  name: registry-creds
+  namespace: shapeblock
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: %s
+`, base64.StdEncoding.EncodeToString([]byte(dockerConfig)))
+
+	if _, err := tmpfile.WriteString(secretYAML); err != nil {
+		return fmt.Errorf("failed to write secret YAML: %v", err)
+	}
+	tmpfile.Close()
+
+	// Apply the secret
+	if err := runCommand("kubectl", "apply", "-f", tmpfile.Name()); err != nil {
+		return fmt.Errorf("failed to create registry credentials secret: %v", err)
+	}
+
+	printStatus(fmt.Sprintf("Docker Registry installed successfully at %s", registryDomain))
+	printStatus("Registry credentials:")
+	printStatus("  Username: shapeblock")
+	printStatus(fmt.Sprintf("  Password: %s", password))
+
+	return nil
+}
+
+func installKpack() error {
+	printStatus("Installing kpack...")
+
+	// Check if kpack already exists
+	if resourceExists("deployment", "kpack-controller", "kpack") {
+		printStatus("kpack already installed")
+		return nil
+	}
+
+	// Create kpack namespace
+	if err := runCommand("kubectl", "create", "namespace", "kpack"); err != nil {
+		if !strings.Contains(err.Error(), "already exists") {
+			return fmt.Errorf("failed to create kpack namespace: %v", err)
+		}
+	}
+
+	// Add shapeblock helm repo
+	if err := addHelmRepo("shapeblock", "https://shapeblock.github.io"); err != nil {
+		return err
+	}
+
+	// Install kpack using helm
+	if err := runCommand("helm", "install", "kpack",
+		"shapeblock/sb-kpack",
+		"--version", "0.1.7",
+		"--namespace", "shapeblock",
+		"--timeout", "600s"); err != nil {
+		return fmt.Errorf("failed to install kpack: %v", err)
+	}
+
+	printStatus("kpack installed successfully")
+	return nil
+}
+
+func installKpackResources() error {
+	printStatus("Installing/Updating kpack resources...")
+
+	resources := []string{
+		"assets/kpack/cluster-stack.yaml",
+		"assets/kpack/go-clusterstore.yaml",
+		"assets/kpack/nginx-clusterstore.yaml",
+		"assets/kpack/node-clusterstore.yaml",
+		"assets/kpack/python-clusterstore.yaml",
+		"assets/kpack/ruby-clusterstore.yaml",
+		"assets/kpack/sb-php-clusterstore.yaml",
+	}
+
+	for _, resource := range resources {
+		// Read embedded file
+		content, err := kpackAssets.ReadFile(resource)
+		if err != nil {
+			printError(fmt.Sprintf("Failed to read resource %s: %v", resource, err))
+			return err
+		}
+
+		// Create temporary file
+		tmpfile, err := os.CreateTemp("", "kpack-*.yaml")
+		if err != nil {
+			printError(fmt.Sprintf("Failed to create temp file: %v", err))
+			return err
+		}
+		defer os.Remove(tmpfile.Name())
+
+		// Write content to temp file
+		if _, err := tmpfile.Write(content); err != nil {
+			printError(fmt.Sprintf("Failed to write to temp file: %v", err))
+			return err
+		}
+		tmpfile.Close()
+
+		// Apply the resource
+		if err := runCommand("kubectl", "apply", "-f", tmpfile.Name()); err != nil {
+			printError(fmt.Sprintf("Failed to install kpack resource %s: %v", resource, err))
+			return err
+		}
+	}
+
+	printStatus("kpack resources installed successfully")
+	return nil
+}
+
+func installFlux2() error {
+	printStatus("Installing Flux2 Helm operator...")
+
+	// Check if Flux2 already exists
+	if resourceExists("deployment", "helm-operator-flux2-helm-controller", "shapeblock") {
+		printStatus("Flux2 Helm operator already installed")
+		return nil
+	}
+
+	// Add fluxcd-community helm repo
+	if err := addHelmRepo("fluxcd-community", "https://fluxcd-community.github.io/helm-charts"); err != nil {
+		return err
+	}
+
+	// Install Flux2 using helm
+	if err := runCommand("helm", "install", "helm-operator",
+		"fluxcd-community/flux2",
+		"--version", "2.13.0",
+		"--namespace", "shapeblock",
+		"--set", "imageAutomationController.create=false",
+		"--set", "imageReflectorController.create=false",
+		"--set", "kustomizeController.create=false",
+		"--timeout", "600s"); err != nil {
+		return fmt.Errorf("failed to install Flux2: %v", err)
+	}
+
+	printStatus("Flux2 Helm operator installed successfully")
+	return nil
+}
+
+func installHelmRepos() error {
+	printStatus("Installing Helm repository custom resources...")
+
+	// Read the directory contents
+	entries, err := helmReposAssets.ReadDir("assets/helm-repos")
+	if err != nil {
+		return fmt.Errorf("failed to read helm repos directory: %v", err)
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".yaml") {
+			// Read embedded file
+			content, err := helmReposAssets.ReadFile(fmt.Sprintf("assets/helm-repos/%s", entry.Name()))
+			if err != nil {
+				printError(fmt.Sprintf("Failed to read helm repo CR %s: %v", entry.Name(), err))
+				return err
+			}
+
+			// Create temporary file
+			tmpfile, err := os.CreateTemp("", "helm-repo-*.yaml")
+			if err != nil {
+				printError(fmt.Sprintf("Failed to create temp file: %v", err))
+				return err
+			}
+			defer os.Remove(tmpfile.Name())
+
+			// Write content to temp file
+			if _, err := tmpfile.Write(content); err != nil {
+				printError(fmt.Sprintf("Failed to write to temp file: %v", err))
+				return err
+			}
+			tmpfile.Close()
+
+			// Apply the resource
+			if err := runCommand("kubectl", "apply", "-f", tmpfile.Name(), "-n", "shapeblock"); err != nil {
+				printError(fmt.Sprintf("Failed to install helm repo CR %s: %v", entry.Name(), err))
+				return err
+			}
+
+			printStatus(fmt.Sprintf("Installed helm repo CR: %s", entry.Name()))
+		}
+	}
+
+	printStatus("Helm repository custom resources installed successfully")
+	return nil
+}
+
+func installSBOperator(config *Config) error {
+	printStatus("Installing ShapeBlock operator...")
+
+	// Check if operator already exists
+	if resourceExists("deployment", "sb-operator", "shapeblock") {
+		printStatus("ShapeBlock operator already installed")
+		return nil
+	}
+
+	// Get domain or use IP if not set
+	domain := config.DomainName
+	if domain == "" {
+		ip, err := getNodeIP()
+		if err != nil {
+			return fmt.Errorf("failed to get node IP: %v", err)
+		}
+		domain = fmt.Sprintf("%s.nip.io", ip)
+	}
+
+	// Create operator YAML
+	operatorYAML := fmt.Sprintf(`apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: shapeblock-admin
+  namespace: shapeblock
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: shapeblock-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: shapeblock-admin
+  namespace: shapeblock
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sb-operator
+  namespace: shapeblock
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      application: sb-operator
+  template:
+    metadata:
+      labels:
+        application: sb-operator
+    spec:
+      serviceAccountName: shapeblock-admin
+      containers:
+      - name: sb-operator
+        image: ghcr.io/shapeblock/operator:v2
+        imagePullPolicy: Always
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /healthz
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 5
+          periodSeconds: 30
+        env:
+          - name: SB_URL
+            value: https://api.%s`, domain)
+
+	// Write YAML to temporary file
+	tmpfile, err := os.CreateTemp("", "sb-operator-*.yaml")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	if _, err := tmpfile.WriteString(operatorYAML); err != nil {
+		return fmt.Errorf("failed to write operator YAML: %v", err)
+	}
+	tmpfile.Close()
+
+	// Apply the operator resources
+	if err := runCommand("kubectl", "apply", "-f", tmpfile.Name()); err != nil {
+		return fmt.Errorf("failed to install ShapeBlock operator: %v", err)
+	}
+
+	printStatus("ShapeBlock operator installed successfully")
+	return nil
+}
+
+func installShapeBlockCRDs() error {
+	printStatus("Installing ShapeBlock CRDs...")
+
+	// Read the directory contents
+	entries, err := shapeblockcrdAssets.ReadDir("assets/shapeblock")
+	if err != nil {
+		return fmt.Errorf("failed to read shapeblock CRDs directory: %v", err)
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".yaml") {
+			// Read embedded file
+			content, err := shapeblockcrdAssets.ReadFile(fmt.Sprintf("assets/shapeblock/%s", entry.Name()))
+			if err != nil {
+				printError(fmt.Sprintf("Failed to read ShapeBlock CRD %s: %v", entry.Name(), err))
+				return err
+			}
+
+			// Create temporary file
+			tmpfile, err := os.CreateTemp("", "shapeblock-crd-*.yaml")
+			if err != nil {
+				printError(fmt.Sprintf("Failed to create temp file: %v", err))
+				return err
+			}
+			defer os.Remove(tmpfile.Name())
+
+			// Write content to temp file
+			if _, err := tmpfile.Write(content); err != nil {
+				printError(fmt.Sprintf("Failed to write to temp file: %v", err))
+				return err
+			}
+			tmpfile.Close()
+
+			// Apply the CRD
+			if err := runCommand("kubectl", "apply", "-f", tmpfile.Name()); err != nil {
+				printError(fmt.Sprintf("Failed to install ShapeBlock CRD %s: %v", entry.Name(), err))
+				return err
+			}
+
+			printStatus(fmt.Sprintf("Installed ShapeBlock CRD: %s", entry.Name()))
+		}
+	}
+
+	printStatus("ShapeBlock CRDs installed successfully")
 	return nil
 }

@@ -7,13 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [unreleased]
 
+### Added
+
+- Install container registry
+- Install kpack
+- Install kpack cluster stores and cluster stacks
+- Install Flux2 Helm operator
+- Install Helm repository custom resources
+- Install ShapeBlock operator
+- Registry credentials secret
+- App and project CRDs
+- Proper cleanup during uninstall
+
 ### Changed
 
 - Fix cron job creation
+- Unified postgres and tfstate postgres into single instance
 
 ### Removed
 
 - Removed resource constraints on backend and frontend.
+- Epinio is no longer installed.
+- Celery worker in backend
 
 ## [1.0.4] - 2024-12-19
 
